@@ -4,10 +4,7 @@ pynput
 python-dotenv
 openai
 torch
-torchaudio
 uiautomation; platform_system == "Windows"
 mlx==0.29.0; platform_system == "Darwin"
 tiktoken==0.8.0
 huggingface-hub==0.24.7
-fire==0.6.0
-librosa==0.10.2.post1

@@ -7,8 +7,6 @@ import time
 from functools import lru_cache
 from subprocess import CalledProcessError, run
 
-import fire
-import librosa
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
@@ -61,7 +59,9 @@ def mel_filters(n_mels):
     base_path = os.path.dirname(os.path.abspath(__file__))
     path_mel = os.path.join(base_path, "mel_filters.npz")
     if not os.path.exists(path_mel):
-        np.savez_compressed(path_mel, mel_128=librosa.filters.mel(sr=16000, n_fft=400, n_mels=128))
+        raise RuntimeError(
+            "Missing mel_filters.npz. This runtime expects mel_filters.npz to be packaged alongside whisper_turbo.py."
+        )
     return mx.load(path_mel)[f"mel_{n_mels}"]
 
 @lru_cache(maxsize=None)
@@ -384,10 +384,14 @@ def benchmark():
     return tics
 
 def fire_main():
+    try:
+        import fire
+    except ImportError as e:
+        raise RuntimeError("fire package is required for whisper_turbo CLI usage") from e
     fire.Fire(transcribe)
 
 if __name__ == '__main__':
-    fire.Fire(transcribe)
+    fire_main()
 
 # benchmarks:
 # 0_test.mp3 any_lang=True quick=True:    0.85
