@@ -1,17 +1,35 @@
-# Voice Input Runtime
+# global_asr
 
-Cross-platform desktop voice input with two interaction modes and selectable transcription backend.
+`global_asr` is a cross-platform voice input runtime focused on dictation for CLI agents and other LLM workflows. It supports fast manual push-to-talk dictation and safer automatic dictation with context gating.
 
-## Features
-- `MANUAL` mode (default): push-to-record and transcribe on demand.
-- `AUTO` mode: VAD-driven automatic segmentation with context validation before insertion.
-- STT backend selection:
-  - Local Whisper Turbo (MLX path, best on macOS)
-  - OpenAI Audio Transcriptions API
-- Global hotkeys:
-  - `F6`: switch mode (`AUTO` / `MANUAL`)
-  - `F4` in `MANUAL`: start/stop recording
-  - `F4` in `AUTO`: toggle auto listening
+## Why this exists
+- Dictate directly into coding assistants, terminals, editors, and chat inputs.
+- Switch between explicit control (`MANUAL`) and hands-free capture (`AUTO`).
+- Reduce accidental inserts with validation in `AUTO` mode.
+
+## Modes
+- `MANUAL` mode (default):
+  - Press `F4` to start recording.
+  - Press `F4` again to stop, transcribe, and insert.
+  - No app/field restrictions by design; user is in control.
+
+- `AUTO` mode:
+  - Uses VAD to segment speech automatically.
+  - Validates focused UI context before insertion.
+  - Applies blocking rules to reduce false positives:
+    - blocks disallowed apps
+    - allows only supported text-input roles (or trusted app exceptions)
+    - aborts when focus changes during/after speech capture
+    - drops low-energy / low-confidence / garbage transcriptions
+
+## Hotkeys
+- `F6`: switch mode (`AUTO` / `MANUAL`)
+- `F4` in `MANUAL`: start/stop recording
+- `F4` in `AUTO`: toggle auto listening ON/OFF
+
+## STT Backends
+- Local Whisper Turbo (best on macOS with MLX)
+- OpenAI Audio Transcriptions API
 
 ## Repository Layout
 - `global_asr.py`: main runtime
@@ -70,13 +88,6 @@ Common keys:
 - `OPENAI_WHISPER_PROMPT=...`
 - `VAD_*` and `ASR_*` thresholds
 
-## Testing Checklist
-1. Launch app and confirm startup mode is `MANUAL`.
-2. Press `F4` to record/stop and verify text insertion.
-3. Press `F6` to switch to `AUTO` and verify mode overlay/state.
-4. In `AUTO`, confirm insertion works in editable fields and is blocked in invalid contexts.
-5. If using OpenAI backend, verify transcription succeeds with your API key.
-
 ## Troubleshooting
 - `OPENAI_API_KEY is required`:
   - set key in `.env` or rerun `setup_asr.py`
@@ -87,6 +98,3 @@ Common keys:
 - no microphone input:
   - verify OS microphone permission and input device selection
 
-## Security
-- `.env` contains secrets and should not be committed.
-- Rotate API keys if exposed.
