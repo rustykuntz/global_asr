@@ -58,9 +58,15 @@ def _ensure_venv_active():
         print("  python setup_asr.py")
         return
 
-    current = os.path.realpath(sys.executable)
-    target = os.path.realpath(venv_python)
-    if current == target:
+    target_prefix = os.path.realpath(configured)
+    current_prefix = os.path.realpath(getattr(sys, "prefix", ""))
+    env_venv = os.getenv("VIRTUAL_ENV")
+
+    if env_venv and os.path.realpath(env_venv) == target_prefix:
+        return
+
+    # Reliable virtualenv detection; sys.executable can point to the same real binary.
+    if current_prefix == target_prefix and getattr(sys, "base_prefix", sys.prefix) != sys.prefix:
         return
 
     print(f"Using project venv interpreter: {venv_python}")
