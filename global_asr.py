@@ -10,14 +10,74 @@ import threading
 import time
 import wave
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_ENV_FILE = os.path.join(_SCRIPT_DIR, ".env")
+
+
+def _read_env_value(path, key):
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                if k.strip() == key:
+                    return v.strip()
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_venv_python(venv_path):
+    venv_path = os.path.abspath(venv_path)
+    if sys.platform.startswith("win"):
+        return os.path.join(venv_path, "Scripts", "python.exe")
+    return os.path.join(venv_path, "bin", "python")
+
+
+def _ensure_venv_active():
+    if os.getenv("ASR_SKIP_VENV_REEXEC", "0") == "1":
+        return
+
+    configured = os.getenv("ASR_VENV_PATH") or _read_env_value(_ENV_FILE, "ASR_VENV_PATH") or ".venv"
+    if not os.path.isabs(configured):
+        configured = os.path.join(_SCRIPT_DIR, configured)
+
+    venv_python = _resolve_venv_python(configured)
+    if not os.path.exists(venv_python):
+        print("Venv not found for global_asr.")
+        print("Suggested setup:")
+        print("  python -m venv .venv")
+        if sys.platform.startswith("win"):
+            print("  .venv\\Scripts\\activate")
+        else:
+            print("  source .venv/bin/activate")
+        print("  python setup_asr.py")
+        return
+
+    current = os.path.realpath(sys.executable)
+    target = os.path.realpath(venv_python)
+    if current == target:
+        return
+
+    print(f"Using project venv interpreter: {venv_python}")
+    env = os.environ.copy()
+    env["ASR_SKIP_VENV_REEXEC"] = "1"
+    script_path = os.path.abspath(sys.argv[0]) if sys.argv else os.path.join(_SCRIPT_DIR, "global_asr.py")
+    os.execve(venv_python, [venv_python, script_path, *sys.argv[1:]], env)
+
+
+_ensure_venv_active()
+
 import numpy as np
 import sounddevice as sd
 from dotenv import load_dotenv
 from pynput.keyboard import Controller, Key, Listener
 
-
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_SCRIPT_DIR, ".env"))
+load_dotenv(_ENV_FILE)
 GET_FOCUS_BIN = os.path.join(_SCRIPT_DIR, "get_focus")
 OVERLAY_PY = os.path.join(_SCRIPT_DIR, "overlay.py")
 WHISPER_TURBO_DIR = os.path.join(_SCRIPT_DIR, "whisper-turbo-mlx")
@@ -32,6 +92,7 @@ VAD_NEGATIVE_THRESHOLD = float(os.getenv("VAD_NEGATIVE_THRESHOLD", 0.25))
 MIN_SPEECH_DURATION_MS = int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", 400))
 MIN_SILENCE_DURATION_MS = int(os.getenv("VAD_REDEMPTION_DURATION_MS", 1000))
 SPEECH_PAD_MS = int(os.getenv("VAD_PRE_SPEECH_PADDING_MS", 800))
+USER_SPEAKING_THRESHOLD = float(os.getenv("VAD_USER_SPEAKING_THRESHOLD", 0.6))
 
 ASR_DICTATION_THRESHOLD = float(os.getenv("ASR_DICTATION_THRESHOLD", -0.12))
 ASR_COMMAND_THRESHOLD = float(os.getenv("ASR_COMMAND_THRESHOLD", -0.2))
@@ -75,7 +136,6 @@ vad_audio = None
 manual_recording_overlay_proc = None
 
 # Lazy-loaded backend/runtime dependencies
-_torch = None
 _vad_model = None
 _local_transcribe = None
 _local_load_model = None
@@ -85,7 +145,7 @@ _win_uia_import_error_logged = False
 
 
 def show_overlay_text(text, color="green", duration=None):
-    if not IS_MAC or not os.path.exists(OVERLAY_PY):
+    if not (IS_MAC or IS_WINDOWS) or not os.path.exists(OVERLAY_PY):
         return None
     try:
         cmd = [
@@ -104,7 +164,7 @@ def show_overlay_text(text, color="green", duration=None):
 
 
 def show_overlay_success():
-    if not IS_MAC or not os.path.exists(OVERLAY_PY):
+    if not (IS_MAC or IS_WINDOWS) or not os.path.exists(OVERLAY_PY):
         return
     try:
         subprocess.Popen([sys.executable, OVERLAY_PY, "--success"])
@@ -132,26 +192,97 @@ def stop_manual_recording_overlay():
 
 
 def ensure_vad_model():
-    global _torch, _vad_model
+    global _vad_model
     if _vad_model is not None:
         return True
-    try:
-        import torch as torch_module
 
-        _torch = torch_module
+    try:
+        import onnxruntime as ort
     except ImportError:
-        print("Error: torch is required for AUTO mode VAD. Install: pip install torch torchaudio")
+        print("Error: onnxruntime is required for AUTO mode VAD. Install: pip install onnxruntime")
         return False
 
-    print("Loading Silero VAD...")
-    _vad_model, _ = _torch.hub.load(
-        repo_or_dir="snakers4/silero-vad",
-        model="silero_vad",
-        force_reload=False,
-        onnx=False,
-    )
-    print("Silero VAD loaded.")
-    return True
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        print("Error: huggingface-hub is required for AUTO mode VAD model download.")
+        return False
+
+    class SileroOnnxVAD:
+        def __init__(self, model_path, sample_rate=16000):
+            self.sample_rate = sample_rate
+            self.num_samples = 512 if sample_rate == 16000 else 256
+            self.context_size = 64 if sample_rate == 16000 else 32
+
+            opts = ort.SessionOptions()
+            opts.inter_op_num_threads = 1
+            opts.intra_op_num_threads = 1
+
+            providers = (
+                ["CPUExecutionProvider"]
+                if "CPUExecutionProvider" in ort.get_available_providers()
+                else None
+            )
+            if providers:
+                self.session = ort.InferenceSession(model_path, providers=providers, sess_options=opts)
+            else:
+                self.session = ort.InferenceSession(model_path, sess_options=opts)
+
+            self.reset_states()
+
+        def reset_states(self, batch_size=1):
+            self._state = np.zeros((2, batch_size, 128), dtype=np.float32)
+            self._context = np.zeros((batch_size, 0), dtype=np.float32)
+            self._last_batch_size = 0
+
+        def process(self, x):
+            x = np.asarray(x, dtype=np.float32)
+            if x.ndim == 1:
+                x = x.reshape(1, -1)
+            if x.ndim != 2:
+                raise ValueError(f"Unexpected audio shape: {x.shape}")
+
+            if x.shape[1] < self.num_samples:
+                x = np.pad(x, ((0, 0), (0, self.num_samples - x.shape[1])), mode="constant")
+            elif x.shape[1] > self.num_samples:
+                x = x[:, : self.num_samples]
+
+            batch_size = x.shape[0]
+            if not self._last_batch_size or self._last_batch_size != batch_size:
+                self.reset_states(batch_size)
+
+            if self._context.shape[1] == 0:
+                self._context = np.zeros((batch_size, self.context_size), dtype=np.float32)
+
+            x_cat = np.concatenate([self._context, x], axis=1)
+            ort_inputs = {
+                "input": x_cat.astype(np.float32),
+                "state": self._state.astype(np.float32),
+                "sr": np.array(self.sample_rate, dtype=np.int64),
+            }
+            ort_outs = self.session.run(None, ort_inputs)
+            out, state = ort_outs
+
+            self._state = state
+            self._context = x_cat[:, -self.context_size :]
+            self._last_batch_size = batch_size
+
+            out = np.asarray(out).reshape(-1)
+            return float(out[0]) if out.size else 0.0
+
+    model_repo = os.getenv("SILERO_VAD_ONNX_REPO", "deepghs/silero-vad-onnx")
+    model_file = os.getenv("SILERO_VAD_ONNX_FILE", "silero_vad.onnx")
+    cache_dir = os.path.join(_SCRIPT_DIR, ".cache")
+
+    try:
+        print("Loading Silero VAD (ONNX)...")
+        model_path = hf_hub_download(repo_id=model_repo, filename=model_file, cache_dir=cache_dir)
+        _vad_model = SileroOnnxVAD(model_path=model_path, sample_rate=SAMPLE_RATE)
+        print("Silero VAD (ONNX) loaded.")
+        return True
+    except Exception as e:
+        print(f"Error loading Silero VAD ONNX model: {e}")
+        return False
 
 
 def ensure_local_backend():
@@ -646,33 +777,34 @@ class VADAudio:
         silence_counter = 0
         start_context = (None, None, None, None, None, None)
         ring_buffer = collections.deque(maxlen=max(1, int(SPEECH_PAD_MS / 32)))
+        auto_active_prev = False
 
         while True:
             chunk = self.buffer_queue.get()
             chunk_flat = chunk.flatten()
 
-            if MODE == "manual":
+            auto_active = MODE == "auto" and AUTO_ASR_ENABLED
+
+            if not auto_active:
+                if auto_active_prev and _vad_model is not None:
+                    _vad_model.reset_states()
+                auto_active_prev = False
+
                 if triggered:
                     triggered = False
                     speech_buffer = []
                     silence_counter = 0
                     ring_buffer.clear()
-                if self.manual_recording:
-                    self.manual_buffer.append(chunk_flat)
-                continue
 
-            if not AUTO_ASR_ENABLED:
-                if triggered:
-                    triggered = False
-                    speech_buffer = []
-                    silence_counter = 0
-                ring_buffer.clear()
+                if MODE == "manual" and self.manual_recording:
+                    self.manual_buffer.append(chunk_flat)
                 continue
 
             if _vad_model is None and not ensure_vad_model():
                 continue
 
-            speech_prob = _vad_model(_torch.from_numpy(chunk_flat), SAMPLE_RATE).item()
+            auto_active_prev = True
+            speech_prob = _vad_model.process(chunk_flat)
 
             if triggered:
                 speech_buffer.append(chunk_flat)

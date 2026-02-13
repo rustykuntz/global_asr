@@ -10,6 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 REQ_PATH = BASE_DIR / "requirements.txt"
 WHISPER_DIR = BASE_DIR / "whisper-turbo-mlx"
+DEFAULT_VENV_DIR = BASE_DIR / ".venv"
 
 
 def ask_choice(title, options, default_index=1):
@@ -50,6 +51,12 @@ def run_cmd(cmd):
         return False
 
 
+def venv_python_path(venv_dir: Path) -> Path:
+    if platform.system() == "Windows":
+        return venv_dir / "Scripts" / "python.exe"
+    return venv_dir / "bin" / "python"
+
+
 def read_env(path):
     data = {}
     if not path.exists():
@@ -72,24 +79,21 @@ def write_env(path, updates):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def warm_local_model():
+def warm_local_model(python_bin):
     if not WHISPER_DIR.exists():
         print(f"Missing local backend folder: {WHISPER_DIR}")
         return False
 
-    if str(WHISPER_DIR) not in sys.path:
-        sys.path.append(str(WHISPER_DIR))
-
-    try:
-        from whisper_turbo import load_model
-    except Exception as e:
-        print(f"Failed to import whisper_turbo: {e}")
-        return False
-
     print("Downloading/loading local Whisper model (one-time warmup)...")
     try:
-        load_model()
-        print("Local model is ready.")
+        code = (
+            "import sys\n"
+            f"sys.path.append({str(WHISPER_DIR)!r})\n"
+            "from whisper_turbo import load_model\n"
+            "load_model()\n"
+            "print('Local model is ready.')\n"
+        )
+        subprocess.run([str(python_bin), "-c", code], check=True)
         return True
     except Exception as e:
         print(f"Failed to download/load local model: {e}")
@@ -98,13 +102,37 @@ def warm_local_model():
 
 def main():
     os_name = platform.system()
+    venv_dir = DEFAULT_VENV_DIR
+    venv_python = venv_python_path(venv_dir)
+    using_venv = venv_python.exists()
 
     print("ASR Setup")
     print(f"Detected OS: {os_name}")
     print("")
 
+    if not using_venv:
+        print("Project venv not found.")
+        print("Suggested commands:")
+        print("  python -m venv .venv")
+        if os_name == "Windows":
+            print("  .venv\\Scripts\\activate")
+        else:
+            print("  source .venv/bin/activate")
+        print("")
+        if ask_yes_no("Create .venv now?", default_yes=True):
+            ok = run_cmd([sys.executable, "-m", "venv", str(venv_dir)])
+            if not ok:
+                print("Failed to create .venv.")
+                sys.exit(1)
+            using_venv = True
+            venv_python = venv_python_path(venv_dir)
+            print(f"Created venv at: {venv_dir}")
+            print("")
+
+    install_python = str(venv_python) if using_venv else sys.executable
+
     if ask_yes_no("Install Python dependencies now?", default_yes=True):
-        ok = run_cmd([sys.executable, "-m", "pip", "install", "-r", str(REQ_PATH)])
+        ok = run_cmd([install_python, "-m", "pip", "install", "-r", str(REQ_PATH)])
         if not ok:
             print("Dependency install failed. Resolve errors, then re-run setup.")
             sys.exit(1)
@@ -134,7 +162,10 @@ def main():
         if not ask_yes_no("Keep local backend anyway?", default_yes=False):
             backend = "openai"
 
-    updates = {"STT_BACKEND": backend}
+    updates = {
+        "STT_BACKEND": backend,
+        "ASR_VENV_PATH": ".venv",
+    }
 
     if backend == "openai":
         while True:
@@ -150,12 +181,17 @@ def main():
     if backend == "local" and os_name == "Darwin":
         print("")
         if ask_yes_no("Download local model now?", default_yes=True):
-            ok = warm_local_model()
+            ok = warm_local_model(install_python)
             if not ok:
                 print("Model warmup failed. You can retry later by running setup again.")
 
     print("\nSetup complete.")
     print("Run:")
+    if using_venv:
+        if os_name == "Windows":
+            print("  .venv\\Scripts\\activate")
+        else:
+            print("  source .venv/bin/activate")
     print("  python global_asr.py")
     print("Controls:")
     print("  F6 = switch mode (AUTO <-> MANUAL)")
