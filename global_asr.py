@@ -1,14 +1,18 @@
 import argparse
+import atexit
 import collections
+import json
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import wave
+from datetime import datetime, timezone
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_FILE = os.path.join(_SCRIPT_DIR, ".env")
@@ -116,8 +120,21 @@ TRUSTED_APPS_WITHOUT_ROLE = os.getenv(
 CMD_ENTER_APPS = os.getenv("CMD_ENTER_APPS", "Code,Cursor,Google Chrome,Arc").split(",")
 
 # Keybindings
-ACTION_KEY = Key.f4
-MODE_KEY = Key.f6
+def _parse_key(value, default):
+    if not value:
+        return default
+    name = value.strip().lower()
+    attr = getattr(Key, name, None)
+    if attr:
+        return attr
+    if len(name) == 1:
+        from pynput.keyboard import KeyCode
+        return KeyCode.from_char(name)
+    return default
+
+ACTION_KEY = _parse_key(os.getenv("ASR_ACTION_KEY"), Key.f4)
+MODE_KEY = _parse_key(os.getenv("ASR_MODE_KEY"), Key.f6)
+CANCEL_KEY = _parse_key(os.getenv("ASR_CANCEL_KEY"), Key.esc)
 
 # Runtime state
 keyboard_controller = Controller()
@@ -148,6 +165,58 @@ _local_load_model = None
 _openai_client = None
 _win_uia = None
 _win_uia_import_error_logged = False
+
+# JSON logs
+_log_file = None
+_drop_log_file = None
+_log_path = os.path.join(_SCRIPT_DIR, "asr_log.jsonl")
+_drop_log_path = os.path.join(_SCRIPT_DIR, "auto-mode-log.jsonl")
+
+
+def _open_log():
+    global _log_file, _drop_log_file
+    try:
+        _log_file = open(_log_path, "a", encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        _drop_log_file = open(_drop_log_path, "a", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _close_log():
+    global _log_file, _drop_log_file
+    for f in (_log_file, _drop_log_file):
+        if f:
+            try:
+                f.close()
+            except Exception:
+                pass
+    _log_file = None
+    _drop_log_file = None
+
+
+def _write_jsonl(f, entry):
+    if f is None:
+        return
+    try:
+        f.write(json.dumps(entry) + "\n")
+        f.flush()
+    except Exception:
+        pass
+
+
+def log_event(event, **data):
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), "event": event}
+    entry.update(data)
+    _write_jsonl(_log_file, entry)
+
+
+def log_drop(reason, **data):
+    entry = {"ts": datetime.now(timezone.utc).isoformat(), "reason": reason}
+    entry.update(data)
+    _write_jsonl(_drop_log_file, entry)
 
 
 def show_overlay_text(text, color="green", duration=None):
@@ -600,6 +669,24 @@ def paste_content(content):
     keyboard_controller.type(content + " ")
 
 
+_METER_WIDTH = 20
+_METER_DB_MIN = -60.0
+_METER_DB_MAX = 0.0
+
+
+def print_level_meter(chunk):
+    rms = np.sqrt(np.mean(chunk ** 2))
+    db = 20 * np.log10(rms + 1e-9)
+    ratio = (db - _METER_DB_MIN) / (_METER_DB_MAX - _METER_DB_MIN)
+    bars = max(0, min(_METER_WIDTH, int(ratio * _METER_WIDTH)))
+    meter = "\u2588" * bars + "\u2591" * (_METER_WIDTH - bars)
+    print(f"\r  \U0001f3a4 {meter} {db:+5.1f} dB  ", end="", flush=True)
+
+
+def clear_level_meter():
+    print("\r" + " " * 40 + "\r", end="", flush=True)
+
+
 def has_low_confidence(avg_logprob, threshold):
     return avg_logprob is not None and avg_logprob < threshold
 
@@ -617,24 +704,29 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
         end_role = None
         end_title = None
 
+        duration = len(audio_data) / SAMPLE_RATE
+
         if source_mode == "auto":
             if not start_context or not end_context:
+                log_drop("missing_context", duration=round(duration, 2))
                 return
 
             start_app, start_role, start_title, _, _, _ = start_context
             end_app, end_role, end_title, _, _, _ = end_context
 
             if not validate_context(start_app, start_role):
+                log_drop("context_rejected", app=start_app, role=start_role, duration=round(duration, 2))
                 return
 
             if (start_app, start_role, start_title) != (end_app, end_role, end_title):
                 print(f"Focus changed during speech ({start_app}:{start_title} -> {end_app}:{end_title}).")
+                log_drop("focus_changed_during_speech", start_app=start_app, end_app=end_app, duration=round(duration, 2))
                 return
 
-        duration = len(audio_data) / SAMPLE_RATE
         rms = np.sqrt(np.mean(audio_data ** 2))
         db_fs = 20 * np.log10(rms + 1e-9)
         if db_fs < ASR_ENERGY_THRESHOLD:
+            log_drop("low_energy", db_fs=round(db_fs, 1), threshold=ASR_ENERGY_THRESHOLD, duration=round(duration, 2))
             return
 
         try:
@@ -642,12 +734,14 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
             result = transcribe_audio(audio_data)
             inference_time = time.perf_counter() - start_time
             if not result:
+                log_drop("transcription_empty", duration=round(duration, 2))
                 return
 
             text = clean_text(str(result.get("text", "")).strip())
             avg_logprob = result.get("avg_logprob")
 
             if not text or text.lower() == "you":
+                log_drop("garbage_text", raw_text=str(result.get("text", "")), avg_logprob=avg_logprob, duration=round(duration, 2))
                 return
 
             action_type = "PASTE"
@@ -657,6 +751,7 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
                 current_app, current_role, current_title, _, _, _ = get_focused_element()
                 if (current_app, current_role, current_title) != (end_app, end_role, end_title):
                     print(f"Focus moved ({end_app}:{end_title} -> {current_app}:{current_title}).")
+                    log_drop("focus_changed_post_transcription", text=text, end_app=end_app, current_app=current_app, duration=round(duration, 2))
                     return
 
                 can_send = (time.time() - last_paste_time) < ASR_SEND_WINDOW_DURATION_S
@@ -687,6 +782,7 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
                     action_type = "IGNORE"
 
             if action_type == "IGNORE":
+                log_drop("low_confidence", text=text, avg_logprob=avg_logprob, threshold=ASR_DICTATION_THRESHOLD, duration=round(duration, 2))
                 return
 
             if action_type == "TOOL":
@@ -702,9 +798,21 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
                 f"OK #{SESSION_COUNTER} mode={source_mode} backend={STT_BACKEND} "
                 f"dur={duration:.2f}s {conf_part} infer={inference_time:.2f}s"
             )
+            log_event(
+                "transcription",
+                session=SESSION_COUNTER,
+                mode=source_mode,
+                backend=STT_BACKEND,
+                text=action_payload,
+                duration=round(duration, 2),
+                avg_logprob=avg_logprob,
+                inference_time=round(inference_time, 2),
+                app=start_app,
+            )
 
         except Exception as e:
             print(f"Transcription failed: {e}")
+            log_event("transcription_error", error=str(e))
 
 
 def auto_mode_supported():
@@ -722,10 +830,22 @@ class VADAudio:
         self.manual_recording = False
         self.manual_buffer = []
 
+    def cancel_manual_recording(self):
+        if not self.manual_recording:
+            return
+        self.manual_recording = False
+        self.manual_buffer = []
+        stop_manual_recording_overlay()
+        clear_level_meter()
+        print("Recording cancelled.")
+        log_event("recording_cancelled")
+        show_overlay_text("CANCELLED", "red")
+
     def start_manual_recording(self):
         self.manual_buffer = []
         self.manual_recording = True
         print("Manual recording started.")
+        log_event("recording_start")
         start_manual_recording_overlay()
 
     def stop_manual_recording(self):
@@ -734,7 +854,9 @@ class VADAudio:
 
         self.manual_recording = False
         stop_manual_recording_overlay()
+        clear_level_meter()
         show_overlay_text("REC STOP", "green")
+        log_event("recording_stop")
 
         if not self.manual_buffer:
             print("Manual recording empty.")
@@ -755,27 +877,51 @@ class VADAudio:
         ).start()
 
     def read_audio(self):
-        def callback(indata, _frames, _time_info, status):
+        def audio_callback(indata, _frames, _time_info, status):
             if status:
                 print(status, file=sys.stderr)
             self.buffer_queue.put(indata.copy())
 
-        input_device, dev_info = get_best_input_device()
-        if input_device is None:
-            print("Error: no valid microphone found.")
-            sys.exit(1)
+        while True:
+            input_device, dev_info = get_best_input_device()
+            if input_device is None:
+                print("No microphone found. Retrying in 2s...")
+                time.sleep(2)
+                continue
 
-        print(f"Input device: {dev_info['name']}")
-        print("Listening...")
+            self._current_device = input_device
+            print(f"Input device: {dev_info['name']}")
+            log_event("device_opened", device=dev_info["name"])
 
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            device=input_device,
-            channels=1,
-            callback=callback,
-            blocksize=512,
-        ):
-            self.process_stream()
+            try:
+                with sd.InputStream(
+                    samplerate=SAMPLE_RATE,
+                    device=input_device,
+                    channels=1,
+                    callback=audio_callback,
+                    blocksize=512,
+                ):
+                    print("Listening...")
+                    self.process_stream()
+            except sd.PortAudioError as e:
+                print(f"Audio device error: {e}")
+                log_event("device_error", error=str(e))
+                time.sleep(1)
+
+            # Drain stale buffers before reopening
+            while not self.buffer_queue.empty():
+                try:
+                    self.buffer_queue.get_nowait()
+                except queue.Empty:
+                    break
+            print("Reopening audio stream...")
+
+    def _device_changed(self):
+        nd, _ = get_best_input_device()
+        if nd is not None and nd != self._current_device:
+            log_event("device_changed")
+            return True
+        return False
 
     def process_stream(self):
         triggered = False
@@ -784,10 +930,20 @@ class VADAudio:
         start_context = (None, None, None, None, None, None)
         ring_buffer = collections.deque(maxlen=max(1, int(SPEECH_PAD_MS / 32)))
         auto_active_prev = False
+        chunk_count = 0
 
         while True:
-            chunk = self.buffer_queue.get()
+            try:
+                chunk = self.buffer_queue.get(timeout=3)
+            except queue.Empty:
+                if self._device_changed():
+                    return
+                continue
+
             chunk_flat = chunk.flatten()
+            chunk_count += 1
+            if chunk_count % 94 == 0 and self._device_changed():
+                return
 
             auto_active = MODE == "auto" and AUTO_ASR_ENABLED
 
@@ -804,6 +960,7 @@ class VADAudio:
 
                 if MODE == "manual" and self.manual_recording:
                     self.manual_buffer.append(chunk_flat)
+                    print_level_meter(chunk_flat)
                 continue
 
             if _vad_model is None and not ensure_vad_model():
@@ -839,6 +996,8 @@ class VADAudio:
                                 args=(full_audio, start_context, end_context, "auto"),
                                 daemon=True,
                             ).start()
+                        else:
+                            log_drop("too_short", duration=round(duration, 2), min_duration=MIN_SPEECH_DURATION_MS / 1000.0)
 
                     speech_buffer = []
                     silence_counter = 0
@@ -874,10 +1033,12 @@ def toggle_mode():
 
         MODE = "auto"
         print("Mode: AUTO")
+        log_event("mode_change", mode="auto")
         show_overlay_text("MODE: AUTO", "green")
     else:
         MODE = "manual"
         print("Mode: MANUAL")
+        log_event("mode_change", mode="manual")
         show_overlay_text("MODE: MANUAL", "red")
 
 
@@ -885,6 +1046,11 @@ def on_press(key):
     global AUTO_ASR_ENABLED
 
     try:
+        if key == CANCEL_KEY:
+            if MODE == "manual" and vad_audio and vad_audio.manual_recording:
+                vad_audio.cancel_manual_recording()
+            return
+
         if key == MODE_KEY:
             toggle_mode()
             return
@@ -949,6 +1115,7 @@ def print_startup_intro():
     print(f"- {MODE_KEY}: switch mode (AUTO <-> MANUAL)")
     print(f"- {ACTION_KEY} in AUTO: toggle auto listening ON/OFF")
     print(f"- {ACTION_KEY} in MANUAL: start/stop recording")
+    print(f"- {CANCEL_KEY} in MANUAL: cancel recording")
     print("")
     print("Modes")
     print("- AUTO: VAD detects speech and transcribes automatically.")
@@ -988,6 +1155,17 @@ def init_optional_context_engine(enable_context):
         context_engine = None
 
 
+def _cleanup():
+    stop_manual_recording_overlay()
+    if context_engine:
+        try:
+            context_engine.stop_server()
+        except Exception:
+            pass
+    log_event("shutdown")
+    _close_log()
+
+
 def main():
     global SELECTED_LANGUAGE, STT_BACKEND, OPENAI_MODEL, OPENAI_PROMPT, vad_audio
 
@@ -997,7 +1175,12 @@ def main():
     OPENAI_MODEL = args.openai_model
     OPENAI_PROMPT = args.openai_prompt
 
+    _open_log()
+    atexit.register(_cleanup)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
     print_startup_intro()
+    log_event("startup", mode=MODE, backend=STT_BACKEND)
 
     init_optional_context_engine(args.context)
 
@@ -1018,12 +1201,6 @@ def main():
         vad_audio.read_audio()
     except KeyboardInterrupt:
         print("\nStopping...")
-        stop_manual_recording_overlay()
-        if context_engine:
-            try:
-                context_engine.stop_server()
-            except Exception:
-                pass
         listener.stop()
 
 

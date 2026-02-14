@@ -26,6 +26,16 @@
 - `F6`: switch mode (`AUTO` / `MANUAL`)
 - `F4` in `MANUAL`: start/stop recording
 - `F4` in `AUTO`: toggle auto listening ON/OFF
+- `ESC` in `MANUAL`: cancel current recording
+
+Hotkeys are configurable in `.env`:
+- `ASR_ACTION_KEY` (default: `f4`)
+- `ASR_MODE_KEY` (default: `f6`)
+- `ASR_CANCEL_KEY` (default: `esc`)
+
+Accepted key values:
+- any `pynput.keyboard.Key` name such as `f1`-`f20`, `esc`, `tab`, `enter`, `space`
+- a single character such as `a`, `/`, `;`
 
 ## STT Backends
 - Local Whisper Turbo (best on macOS with MLX)
@@ -80,13 +90,24 @@ Options:
 
 ## Configuration
 Configuration is read from `.env` in this folder.
+Use `.env.example` as a starting point.
 
 Common keys:
+- `ASR_ACTION_KEY=f4`
+- `ASR_MODE_KEY=f6`
+- `ASR_CANCEL_KEY=esc`
 - `STT_BACKEND=local|openai`
 - `OPENAI_API_KEY=...`
 - `OPENAI_WHISPER_MODEL=whisper-1`
 - `OPENAI_WHISPER_PROMPT=...`
 - `VAD_*` and `ASR_*` thresholds
+
+## Input Device Behavior
+- Uses the OS default input device when available.
+- If no default input device is set, picks the first valid microphone.
+- Re-checks for device changes while running and reopens the stream automatically.
+- Also reopens on audio stream errors (for example, unplugged device).
+- Clears stale buffered audio when switching streams.
 
 ## Troubleshooting
 - `OPENAI_API_KEY is required`:
@@ -97,4 +118,3 @@ Common keys:
   - run `python setup_asr.py` again and select local backend
 - no microphone input:
   - verify OS microphone permission and input device selection
-

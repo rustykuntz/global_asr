@@ -11,6 +11,7 @@ env/
 # Environment / secrets
 .env
 .env.*
+!.env.example
 
 # Build / packaging
 build/
@@ -32,5 +33,6 @@ htmlcov/
 
 # Runtime logs / temp
 *.log
+*.jsonl
 *.tmp
 *.temp
