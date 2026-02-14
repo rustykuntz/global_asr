@@ -56,7 +56,7 @@ def _ensure_venv_active():
         else:
             print("  source .venv/bin/activate")
         print("  python setup_asr.py")
-        return
+        raise SystemExit(1)
 
     target_prefix = os.path.realpath(configured)
     current_prefix = os.path.realpath(getattr(sys, "prefix", ""))
