@@ -36,3 +36,6 @@ htmlcov/
 *.jsonl
 *.tmp
 *.temp
+
+# Local replacements (can contain sensitive/private terms)
+transcription_replacements.txt

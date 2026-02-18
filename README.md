@@ -107,7 +107,14 @@ Common keys:
 - Purpose: fix recurring Whisper mis-transcriptions after transcription and before text insertion.
 - Execution point: replacements are applied after transcript cleanup and right before `keyboard_controller.type(...)`.
 - Default file: `transcription_replacements.txt` in the project root.
+- Repo sample file: `transcription_replacements.sample.txt` (tracked).
+- Local file `transcription_replacements.txt` is gitignored so private terms are not committed.
 - Optional override: set `ASR_REPLACEMENTS_FILE` in `.env`.
+
+Initialize your local file:
+```bash
+cp transcription_replacements.sample.txt transcription_replacements.txt
+```
 
 Format:
 - one rule per line

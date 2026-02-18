@@ -1,0 +1,9 @@
+# Transcription replacements sample
+# Copy to transcription_replacements.txt and edit locally.
+# Format: wrong term => correct term
+# Modes:
+# - default is mode=exact (case-sensitive source match)
+# - use | mode=all for case-insensitive source match
+
+Rossie => Rocie | mode=all
+my o card ee al infarction => myocardial infarction | mode=all
