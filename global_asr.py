@@ -715,6 +715,37 @@ def _load_transcription_replacements():
                 value = value[1:-1].strip()
             return value
 
+        def parse_rule_mode(options, line_num, line):
+            mode = "exact"
+            for option in options:
+                token = option.strip()
+                if not token:
+                    continue
+                key = token.lower()
+                if key in {"all", "match_all"}:
+                    mode = "all"
+                    continue
+                if key.startswith("mode="):
+                    value = key.split("=", 1)[1].strip()
+                    if value == "exact":
+                        mode = "exact"
+                    elif value in {"all", "match_all"}:
+                        mode = "all"
+                    else:
+                        print(f"Invalid replacement mode on line {line_num}: {line}")
+                    continue
+                if key.startswith("match_all="):
+                    value = key.split("=", 1)[1].strip()
+                    if value in {"1", "true", "yes", "on"}:
+                        mode = "all"
+                    elif value in {"0", "false", "no", "off"}:
+                        mode = "exact"
+                    else:
+                        print(f"Invalid match_all option on line {line_num}: {line}")
+                    continue
+                print(f"Unknown replacement option on line {line_num}: {line}")
+            return mode
+
         with open(TRANSCRIPTION_REPLACEMENTS_FILE, "r", encoding="utf-8") as f:
             for line_num, raw in enumerate(f, 1):
                 line = raw.strip()
@@ -723,22 +754,27 @@ def _load_transcription_replacements():
                 if "=>" not in line:
                     print(f"Invalid replacement line {line_num}: {line}")
                     continue
-                source, target = (normalize_rule_value(part) for part in line.split("=>", 1))
+                source_raw, right_side = line.split("=>", 1)
+                right_parts = right_side.split("|")
+                source = normalize_rule_value(source_raw)
+                target = normalize_rule_value(right_parts[0]) if right_parts else ""
+                mode = parse_rule_mode(right_parts[1:], line_num, line)
                 if not source:
                     continue
                 escaped_parts = [re.escape(part) for part in re.split(r"\s+", source) if part]
                 if not escaped_parts:
                     continue
                 source_pattern = r"\s+".join(escaped_parts)
-                pattern = re.compile(rf"(?<!\w){source_pattern}(?!\w)", re.IGNORECASE)
-                rules.append((source, target, pattern))
+                flags = re.IGNORECASE if mode == "all" else 0
+                pattern = re.compile(rf"(?<!\w){source_pattern}(?!\w)", flags)
+                rules.append((source, target, pattern, mode))
     except Exception as e:
         print(f"Failed to load transcription replacements: {e}")
         _transcription_replacements = []
         _transcription_replacements_mtime = None
         return
 
-    rules.sort(key=lambda item: len(item[0]), reverse=True)
+    rules.sort(key=lambda item: (-len(item[0]), 0 if item[3] == "exact" else 1))
     _transcription_replacements = rules
     _transcription_replacements_mtime = mtime
 
@@ -747,7 +783,7 @@ def apply_transcription_replacements(text):
     if not text:
         return text
     _load_transcription_replacements()
-    for _, target, pattern in _transcription_replacements:
+    for _, target, pattern, _ in _transcription_replacements:
         text = pattern.sub(target, text)
     return text
 

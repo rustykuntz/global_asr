@@ -1,9 +1,13 @@
 # Transcription replacements
 # Format: wrong term => correct term
-# Matching is case-insensitive.
+# Modes:
+# - default is mode=exact (case-sensitive source match)
+# - use | mode=all for case-insensitive source match
+# Replacement target is always inserted exactly as written.
 
-Rossie => Rocie
-Rossi => Rocie
-Rosi => Rocie
-AgentBrowser => agent-browser
-Agent Browser => agent-browser
+Rossie => Rocie | mode=all
+Rossi => Rocie | mode=all
+Rosi => Rocie | mode=all
+AgentBrowser => agent-browser | mode=all
+Agent Browser => agent-browser | mode=all
+skill.md => SKILL.md

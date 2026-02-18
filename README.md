@@ -111,16 +111,20 @@ Common keys:
 
 Format:
 - one rule per line
-- `wrong term => correct term`
+- `wrong term => correct term` (default `mode=exact`)
+- optional mode: `wrong term => correct term | mode=all`
 - lines starting with `#` are comments
-- matching is case-insensitive and term-based
+- `mode=exact`: case-sensitive source matching
+- `mode=all` / `mode=match_all`: case-insensitive source matching
+- replacement text is always inserted exactly as written in the rule target
 - optional wrapping quotes are allowed (example: `'Rossie' => 'Rocie'`)
 - spaces inside a source phrase are whitespace-tolerant (` `, tabs, newlines)
 
 Example:
 ```txt
 Rossie => Rocie
-my o card ee al infarction => myocardial infarction
+Rossie => Rocie | mode=all
+my o card ee al infarction => myocardial infarction | match_all=true
 ```
 
 ## Input Device Behavior
