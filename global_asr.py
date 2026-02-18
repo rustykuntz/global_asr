@@ -91,6 +91,9 @@ load_dotenv(_ENV_FILE)
 GET_FOCUS_BIN = os.path.join(_SCRIPT_DIR, "get_focus")
 OVERLAY_PY = os.path.join(_SCRIPT_DIR, "overlay.py")
 WHISPER_TURBO_DIR = os.path.join(_SCRIPT_DIR, "whisper-turbo-mlx")
+TRANSCRIPTION_REPLACEMENTS_FILE = os.getenv("ASR_REPLACEMENTS_FILE", "transcription_replacements.txt")
+if not os.path.isabs(TRANSCRIPTION_REPLACEMENTS_FILE):
+    TRANSCRIPTION_REPLACEMENTS_FILE = os.path.join(_SCRIPT_DIR, TRANSCRIPTION_REPLACEMENTS_FILE)
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
 
@@ -109,6 +112,7 @@ ASR_COMMAND_THRESHOLD = float(os.getenv("ASR_COMMAND_THRESHOLD", -0.2))
 ASR_ENERGY_THRESHOLD = float(os.getenv("ASR_ENERGY_THRESHOLD", -45.6))
 TOOL_INSTRUCTION_DURATION = float(os.getenv("TOOL_INSTRUCTION_DURATION", 2.5))
 ASR_SEND_WINDOW_DURATION_S = float(os.getenv("ASR_SEND_WINDOW_DURATION_S", 5.0))
+MODE_OVERLAY_DURATION_S = max(3.0, min(5.0, float(os.getenv("MODE_OVERLAY_DURATION_S", 4.0))))
 
 # Context filters (auto mode only)
 DISAPPROVED_APPS = ["Calculator", "System Settings", "Finder"]
@@ -165,6 +169,8 @@ _local_load_model = None
 _openai_client = None
 _win_uia = None
 _win_uia_import_error_logged = False
+_transcription_replacements = []
+_transcription_replacements_mtime = None
 
 # JSON logs
 _log_file = None
@@ -219,7 +225,7 @@ def log_drop(reason, **data):
     _write_jsonl(_drop_log_file, entry)
 
 
-def show_overlay_text(text, color="green", duration=None):
+def show_overlay_text(text, color="green", duration=None, kind=None):
     if not (IS_MAC or IS_WINDOWS) or not os.path.exists(OVERLAY_PY):
         return None
     try:
@@ -230,9 +236,13 @@ def show_overlay_text(text, color="green", duration=None):
             text,
             "--color",
             color,
+            "--parent-pid",
+            str(os.getpid()),
         ]
         if duration is not None:
             cmd.extend(["--duration", str(duration)])
+        if kind:
+            cmd.extend(["--kind", kind])
         return subprocess.Popen(cmd)
     except Exception:
         return None
@@ -247,10 +257,37 @@ def show_overlay_success():
         pass
 
 
+def show_mode_overlay(text, color):
+    show_overlay_text(text, color, duration=MODE_OVERLAY_DURATION_S)
+
+
+def cleanup_stale_recording_overlays():
+    # Best-effort cleanup for stale REC overlays from prior runs.
+    if not IS_MAC:
+        return
+    try:
+        subprocess.run(
+            ["pkill", "-f", f"{OVERLAY_PY} --kind rec"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        # Backward-compat with older versions that did not use --kind.
+        subprocess.run(
+            ["pkill", "-f", f"{OVERLAY_PY} --text REC"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
 def start_manual_recording_overlay():
     global manual_recording_overlay_proc
     stop_manual_recording_overlay()
-    manual_recording_overlay_proc = show_overlay_text("REC ●", "red", duration=86400)
+    # Duration <= 0 means "no auto-timeout"; this stays visible until explicitly stopped.
+    manual_recording_overlay_proc = show_overlay_text("REC ●", "red", duration=0, kind="rec")
 
 
 def stop_manual_recording_overlay():
@@ -653,6 +690,68 @@ def clean_text(text):
     return text
 
 
+def _load_transcription_replacements():
+    global _transcription_replacements, _transcription_replacements_mtime
+    if not os.path.exists(TRANSCRIPTION_REPLACEMENTS_FILE):
+        _transcription_replacements = []
+        _transcription_replacements_mtime = None
+        return
+
+    try:
+        mtime = os.path.getmtime(TRANSCRIPTION_REPLACEMENTS_FILE)
+    except OSError:
+        _transcription_replacements = []
+        _transcription_replacements_mtime = None
+        return
+
+    if _transcription_replacements_mtime == mtime:
+        return
+
+    rules = []
+    try:
+        def normalize_rule_value(value):
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1].strip()
+            return value
+
+        with open(TRANSCRIPTION_REPLACEMENTS_FILE, "r", encoding="utf-8") as f:
+            for line_num, raw in enumerate(f, 1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=>" not in line:
+                    print(f"Invalid replacement line {line_num}: {line}")
+                    continue
+                source, target = (normalize_rule_value(part) for part in line.split("=>", 1))
+                if not source:
+                    continue
+                escaped_parts = [re.escape(part) for part in re.split(r"\s+", source) if part]
+                if not escaped_parts:
+                    continue
+                source_pattern = r"\s+".join(escaped_parts)
+                pattern = re.compile(rf"(?<!\w){source_pattern}(?!\w)", re.IGNORECASE)
+                rules.append((source, target, pattern))
+    except Exception as e:
+        print(f"Failed to load transcription replacements: {e}")
+        _transcription_replacements = []
+        _transcription_replacements_mtime = None
+        return
+
+    rules.sort(key=lambda item: len(item[0]), reverse=True)
+    _transcription_replacements = rules
+    _transcription_replacements_mtime = mtime
+
+
+def apply_transcription_replacements(text):
+    if not text:
+        return text
+    _load_transcription_replacements()
+    for _, target, pattern in _transcription_replacements:
+        text = pattern.sub(target, text)
+    return text
+
+
 def send_message(current_app):
     if current_app in CMD_ENTER_APPS:
         mod_key = Key.cmd if IS_MAC else Key.ctrl
@@ -737,11 +836,12 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
                 log_drop("transcription_empty", duration=round(duration, 2))
                 return
 
-            text = clean_text(str(result.get("text", "")).strip())
+            raw_text = str(result.get("text", "")).strip()
+            text = apply_transcription_replacements(clean_text(raw_text))
             avg_logprob = result.get("avg_logprob")
 
             if not text or text.lower() == "you":
-                log_drop("garbage_text", raw_text=str(result.get("text", "")), avg_logprob=avg_logprob, duration=round(duration, 2))
+                log_drop("garbage_text", raw_text=raw_text, avg_logprob=avg_logprob, duration=round(duration, 2))
                 return
 
             action_type = "PASTE"
@@ -1034,12 +1134,12 @@ def toggle_mode():
         MODE = "auto"
         print("Mode: AUTO")
         log_event("mode_change", mode="auto")
-        show_overlay_text("MODE: AUTO", "green")
+        show_mode_overlay("MODE: AUTO", "green")
     else:
         MODE = "manual"
         print("Mode: MANUAL")
         log_event("mode_change", mode="manual")
-        show_overlay_text("MODE: MANUAL", "red")
+        show_mode_overlay("MODE: MANUAL", "red")
 
 
 def on_press(key):
@@ -1157,6 +1257,7 @@ def init_optional_context_engine(enable_context):
 
 def _cleanup():
     stop_manual_recording_overlay()
+    cleanup_stale_recording_overlays()
     if context_engine:
         try:
             context_engine.stop_server()
@@ -1190,7 +1291,8 @@ def main():
     if STT_BACKEND == "openai" and not ensure_openai_backend():
         sys.exit(1)
 
-    show_overlay_text("MODE: MANUAL", "red")
+    cleanup_stale_recording_overlays()
+    show_mode_overlay("MODE: MANUAL", "red")
 
     listener = Listener(on_press=on_press)
     listener.start()

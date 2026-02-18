@@ -1,0 +1,9 @@
+# Transcription replacements
+# Format: wrong term => correct term
+# Matching is case-insensitive.
+
+Rossie => Rocie
+Rossi => Rocie
+Rosi => Rocie
+AgentBrowser => agent-browser
+Agent Browser => agent-browser

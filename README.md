@@ -100,7 +100,28 @@ Common keys:
 - `OPENAI_API_KEY=...`
 - `OPENAI_WHISPER_MODEL=whisper-1`
 - `OPENAI_WHISPER_PROMPT=...`
+- `ASR_REPLACEMENTS_FILE=transcription_replacements.txt` (optional)
 - `VAD_*` and `ASR_*` thresholds
+
+## Custom Word Replacements
+- Purpose: fix recurring Whisper mis-transcriptions after transcription and before text insertion.
+- Execution point: replacements are applied after transcript cleanup and right before `keyboard_controller.type(...)`.
+- Default file: `transcription_replacements.txt` in the project root.
+- Optional override: set `ASR_REPLACEMENTS_FILE` in `.env`.
+
+Format:
+- one rule per line
+- `wrong term => correct term`
+- lines starting with `#` are comments
+- matching is case-insensitive and term-based
+- optional wrapping quotes are allowed (example: `'Rossie' => 'Rocie'`)
+- spaces inside a source phrase are whitespace-tolerant (` `, tabs, newlines)
+
+Example:
+```txt
+Rossie => Rocie
+my o card ee al infarction => myocardial infarction
+```
 
 ## Input Device Behavior
 - Uses the OS default input device when available.
