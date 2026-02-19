@@ -1,3 +1,4 @@
+import os
 import sys
 
 
@@ -19,11 +20,39 @@ def _parse_duration(default_duration):
         return default_duration
     try:
         value = float(raw)
-        if value > 0:
-            return value
+        if value <= 0:
+            return None
+        return value
     except Exception:
         pass
     return default_duration
+
+
+def _parse_parent_pid():
+    raw = _arg_value("--parent-pid", None)
+    if raw is None:
+        return None
+    try:
+        pid = int(raw)
+        if pid > 0:
+            return pid
+    except Exception:
+        pass
+    return None
+
+
+def _pid_exists(pid):
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
 
 
 def _parse_payload():
@@ -51,6 +80,7 @@ def _run_macos_overlay():
     import objc
 
     is_success, label_text, color = _parse_payload()
+    parent_pid = _parse_parent_pid()
 
     class OverlayController(AppKit.NSObject):
         def init(self):
@@ -59,6 +89,7 @@ def _run_macos_overlay():
             self.label_text = label_text
             self.color = color
             self.is_success = is_success
+            self.parent_pid = parent_pid
             return self
 
         def applicationDidFinishLaunching_(self, notification):
@@ -89,12 +120,21 @@ def _run_macos_overlay():
             self.window.makeKeyAndOrderFront_(None)
             self.window.orderFrontRegardless()
 
-            AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                self.duration, self, "closeWindow:", None, False
-            )
+            if self.duration is not None:
+                AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    self.duration, self, "closeWindow:", None, False
+                )
+            if self.parent_pid is not None:
+                AppKit.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                    0.7, self, "checkParent:", None, True
+                )
 
         def closeWindow_(self, timer):
             AppKit.NSApplication.sharedApplication().terminate_(self)
+
+        def checkParent_(self, timer):
+            if not _pid_exists(self.parent_pid):
+                AppKit.NSApplication.sharedApplication().terminate_(self)
 
     class OverlayView(AppKit.NSView):
         def drawRect_(self, rect):
@@ -141,8 +181,7 @@ def _run_windows_overlay():
 
     is_success, label_text, color = _parse_payload()
     duration_s = _parse_duration(1.5 if is_success else 2.5)
-    if duration_s <= 0:
-        duration_s = 1.5
+    parent_pid = _parse_parent_pid()
 
     root = tk.Tk()
     root.overrideredirect(True)
@@ -172,7 +211,18 @@ def _run_windows_overlay():
     else:
         canvas.create_oval(2, 2, 12, 12, fill=dot, outline=dot)
 
-    root.after(int(duration_s * 1000), root.destroy)
+    if duration_s is not None:
+        root.after(int(duration_s * 1000), root.destroy)
+
+    def check_parent():
+        if parent_pid is None:
+            return
+        if not _pid_exists(parent_pid):
+            root.destroy()
+            return
+        root.after(700, check_parent)
+
+    check_parent()
     root.mainloop()
 
 
