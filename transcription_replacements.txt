@@ -14,7 +14,13 @@ Agent Browser => agent-browser | mode=all
 
 # File names often spoken with spaces or missing punctuation
 skill md => SKILL.md | mode=all
+skillmd => SKILL.md | mode=all
 toolmd => TOOL.md | mode=all
 
 # Exact mode example (case-sensitive source match)
 config YAM => config.yaml
+
+Rosi => Rocie | mode=all
+Rossi => Rocie | mode=all
+Rosy => Rocie | mode=all
+

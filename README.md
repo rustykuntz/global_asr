@@ -91,6 +91,18 @@ Options:
 - `--openai-prompt OPENAI_PROMPT`
 - `--context` (enable context engine in `AUTO` mode)
 
+Language examples:
+```bash
+# Auto-detect language (default)
+python global_asr.py --lang auto
+
+# Force English
+python global_asr.py --lang en
+
+# Force Spanish with OpenAI backend
+python global_asr.py --stt-backend openai --lang es
+```
+
 ## Configuration
 Configuration is read from `.env` in this folder.
 Use `.env.example` as a starting point.
