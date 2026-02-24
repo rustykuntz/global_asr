@@ -79,7 +79,7 @@ def write_env(path, updates):
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def warm_local_model(python_bin):
+def warm_local_model_mlx(python_bin):
     if not WHISPER_DIR.exists():
         print(f"Missing local backend folder: {WHISPER_DIR}")
         return False
@@ -97,6 +97,21 @@ def warm_local_model(python_bin):
         return True
     except Exception as e:
         print(f"Failed to download/load local model: {e}")
+        return False
+
+
+def warm_local_model_faster_whisper(python_bin):
+    print("Downloading/loading faster-whisper model (one-time warmup)...")
+    try:
+        code = (
+            "from faster_whisper import WhisperModel\n"
+            "WhisperModel('small', device='auto', compute_type='int8')\n"
+            "print('faster-whisper model is ready.')\n"
+        )
+        subprocess.run([str(python_bin), "-c", code], check=True)
+        return True
+    except Exception as e:
+        print(f"Failed to download/load faster-whisper model: {e}")
         return False
 
 
@@ -152,13 +167,13 @@ def main():
             "Choose speech backend:",
             [
                 ("openai", "OpenAI Whisper API (recommended)"),
-                ("local", "Local Whisper Turbo"),
+                ("local", "Local Whisper (faster-whisper on Windows)"),
             ],
             default_index=1,
         )
 
-    if backend == "local" and os_name != "Darwin":
-        print("Local Whisper Turbo is optimized for macOS/MLX.")
+    if backend == "local" and os_name not in {"Darwin", "Windows"}:
+        print("Local backend on this OS uses faster-whisper (AUTO mode may still be unsupported).")
         if not ask_yes_no("Keep local backend anyway?", default_yes=False):
             backend = "openai"
 
@@ -178,10 +193,13 @@ def main():
     write_env(ENV_PATH, updates)
     print(f"Saved configuration: {ENV_PATH}")
 
-    if backend == "local" and os_name == "Darwin":
+    if backend == "local" and os_name in {"Darwin", "Windows"}:
         print("")
         if ask_yes_no("Download local model now?", default_yes=True):
-            ok = warm_local_model(install_python)
+            if os_name == "Darwin":
+                ok = warm_local_model_mlx(install_python)
+            else:
+                ok = warm_local_model_faster_whisper(install_python)
             if not ok:
                 print("Model warmup failed. You can retry later by running setup again.")
 

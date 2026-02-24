@@ -6,6 +6,7 @@ openai
 anyio>=4.8,<5
 onnxruntime
 uiautomation; platform_system == "Windows"
+faster-whisper; platform_system == "Windows"
 mlx==0.29.0; platform_system == "Darwin"
 tiktoken==0.8.0
 huggingface-hub>=0.33.5,<2

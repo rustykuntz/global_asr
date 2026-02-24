@@ -96,6 +96,12 @@ if not os.path.isabs(TRANSCRIPTION_REPLACEMENTS_FILE):
     TRANSCRIPTION_REPLACEMENTS_FILE = os.path.join(_SCRIPT_DIR, TRANSCRIPTION_REPLACEMENTS_FILE)
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
+FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "small")
+FASTER_WHISPER_DEVICE = os.getenv("FASTER_WHISPER_DEVICE", "auto")
+FASTER_WHISPER_COMPUTE_TYPE = os.getenv(
+    "FASTER_WHISPER_COMPUTE_TYPE",
+    "int8" if IS_WINDOWS else "default",
+)
 
 
 # Audio and ASR config
@@ -166,6 +172,8 @@ manual_recording_overlay_proc = None
 _vad_model = None
 _local_transcribe = None
 _local_load_model = None
+_local_backend_kind = None
+_local_backend_obj = None
 _openai_client = None
 _win_uia = None
 _win_uia_import_error_logged = False
@@ -398,25 +406,76 @@ def ensure_vad_model():
 
 
 def ensure_local_backend():
-    global _local_transcribe, _local_load_model
-    if _local_transcribe is not None and _local_load_model is not None:
+    global _local_transcribe, _local_load_model, _local_backend_kind, _local_backend_obj
+    if _local_transcribe is not None and _local_load_model is not None and _local_backend_kind is not None:
         return True
 
-    if not os.path.isdir(WHISPER_TURBO_DIR):
-        print(f"Error: local backend not found: {WHISPER_TURBO_DIR}")
-        return False
+    if IS_MAC:
+        if not os.path.isdir(WHISPER_TURBO_DIR):
+            print(f"Error: local backend not found: {WHISPER_TURBO_DIR}")
+            return False
 
-    if WHISPER_TURBO_DIR not in sys.path:
-        sys.path.append(WHISPER_TURBO_DIR)
+        if WHISPER_TURBO_DIR not in sys.path:
+            sys.path.append(WHISPER_TURBO_DIR)
+
+        try:
+            from whisper_turbo import load_model as local_load_model, transcribe as local_transcribe
+        except ImportError as e:
+            print(f"Error importing local backend whisper_turbo: {e}")
+            return False
+
+        _local_transcribe = local_transcribe
+        _local_load_model = local_load_model
+        _local_backend_kind = "mlx"
+        return True
 
     try:
-        from whisper_turbo import load_model as local_load_model, transcribe as local_transcribe
-    except ImportError as e:
-        print(f"Error importing local backend whisper_turbo: {e}")
+        from faster_whisper import WhisperModel
+    except ImportError:
+        print(
+            "Error: faster-whisper is required for local backend on Windows/non-macOS. "
+            "Install: pip install faster-whisper"
+        )
         return False
+
+    def local_load_model():
+        global _local_backend_obj
+        if _local_backend_obj is None:
+            print(
+                "Loading local faster-whisper model "
+                f"({FASTER_WHISPER_MODEL}, device={FASTER_WHISPER_DEVICE}, compute={FASTER_WHISPER_COMPUTE_TYPE})..."
+            )
+            _local_backend_obj = WhisperModel(
+                FASTER_WHISPER_MODEL,
+                device=FASTER_WHISPER_DEVICE,
+                compute_type=FASTER_WHISPER_COMPUTE_TYPE,
+            )
+        return _local_backend_obj
+
+    def local_transcribe(path_audio, lang):
+        model = local_load_model()
+        kwargs = {"task": "transcribe", "word_timestamps": False}
+        if lang and lang != "auto":
+            kwargs["language"] = lang
+
+        segments_iter, info = model.transcribe(path_audio, **kwargs)
+        segments = list(segments_iter)
+        text = "".join(getattr(seg, "text", "") for seg in segments).strip()
+
+        logprobs = [getattr(seg, "avg_logprob", None) for seg in segments]
+        logprobs = [lp for lp in logprobs if isinstance(lp, (int, float))]
+        avg_logprob = (sum(logprobs) / len(logprobs)) if logprobs else None
+
+        detected_lang = getattr(info, "language", "unknown") or "unknown"
+        return {
+            "text": text,
+            "avg_logprob": avg_logprob,
+            "language": detected_lang,
+        }
 
     _local_transcribe = local_transcribe
     _local_load_model = local_load_model
+    _local_backend_kind = "faster_whisper"
     return True
 
 
@@ -445,7 +504,15 @@ def transcribe_audio_local(audio_data):
         return None
 
     _local_load_model()
-    result = _local_transcribe(path_audio=audio_data, lang=SELECTED_LANGUAGE)
+    if _local_backend_kind == "faster_whisper":
+        tmp_path = write_temp_wav(audio_data)
+        try:
+            result = _local_transcribe(path_audio=tmp_path, lang=SELECTED_LANGUAGE)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    else:
+        result = _local_transcribe(path_audio=audio_data, lang=SELECTED_LANGUAGE)
 
     text = str(result.get("text", "")).strip()
     avg_logprob = result.get("avg_logprob")

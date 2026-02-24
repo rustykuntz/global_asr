@@ -38,7 +38,9 @@ Accepted key values:
 - a single character such as `a`, `/`, `;`
 
 ## STT Backends
-- Local Whisper Turbo (best on macOS with MLX)
+- Local backend:
+  - macOS: Whisper Turbo (MLX)
+  - Windows: faster-whisper
 - OpenAI Audio Transcriptions API
 
 ## Repository Layout
@@ -60,6 +62,7 @@ Platform notes:
   - local backend requires MLX stack and typically `ffmpeg`
 - Windows:
   - `AUTO` mode requires `uiautomation`
+  - local backend uses `faster-whisper`
   - `MANUAL` mode works without UI focus integration
 
 ## Quick Start
@@ -73,7 +76,7 @@ python global_asr.py
 1. Install dependencies from `requirements.txt`.
 2. Ask you to choose STT backend (`local` or `openai`).
 3. If `openai` is selected, prompt for `OPENAI_API_KEY`.
-4. If `local` is selected on macOS, optionally warm/download local model.
+4. If `local` is selected, optionally warm/download the local model (macOS MLX or Windows faster-whisper).
 5. Save configuration to `.env`.
 
 ## Run Options
@@ -100,6 +103,9 @@ Common keys:
 - `OPENAI_API_KEY=...`
 - `OPENAI_WHISPER_MODEL=whisper-1`
 - `OPENAI_WHISPER_PROMPT=...`
+- `FASTER_WHISPER_MODEL=small` (optional, Windows local backend)
+- `FASTER_WHISPER_DEVICE=auto` (optional, Windows local backend)
+- `FASTER_WHISPER_COMPUTE_TYPE=int8` (optional, Windows local backend)
 - `ASR_REPLACEMENTS_FILE=transcription_replacements.txt` (optional)
 - `VAD_*` and `ASR_*` thresholds
 
@@ -148,5 +154,6 @@ my o card ee al infarction => myocardial infarction | match_all=true
   - install dependency: `pip install uiautomation`
 - local backend import/load issues:
   - run `python setup_asr.py` again and select local backend
+  - on Windows, verify `faster-whisper` installed in the project venv
 - no microphone input:
   - verify OS microphone permission and input device selection
