@@ -37,7 +37,3 @@ htmlcov/
 *.tmp
 *.temp
 .cache/
-
-# Local replacements (can contain sensitive/private terms)
-transcription_replacements.txt
-.cache/
