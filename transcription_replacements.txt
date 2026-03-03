@@ -24,3 +24,6 @@ Rosi => Rocie | mode=all
 Rossi => Rocie | mode=all
 Rosy => Rocie | mode=all
 
+JGPT => ChatGPT | mode=all
+chat GPT => ChatGPT | mode=all
+Chagypt => ChatGPT | mode=all

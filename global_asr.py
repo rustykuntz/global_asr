@@ -112,6 +112,11 @@ MIN_SPEECH_DURATION_MS = int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", 400))
 MIN_SILENCE_DURATION_MS = int(os.getenv("VAD_REDEMPTION_DURATION_MS", 1000))
 SPEECH_PAD_MS = int(os.getenv("VAD_PRE_SPEECH_PADDING_MS", 800))
 USER_SPEAKING_THRESHOLD = float(os.getenv("VAD_USER_SPEAKING_THRESHOLD", 0.6))
+SILENCE_WAIT = (os.getenv("ASR_SILENCE_WAIT", "normal") or "normal").strip().lower()
+SILENCE_WAIT_MS = {
+    "normal": MIN_SILENCE_DURATION_MS,
+    "long": 4000,
+}
 
 ASR_DICTATION_THRESHOLD = float(os.getenv("ASR_DICTATION_THRESHOLD", -0.12))
 ASR_COMMAND_THRESHOLD = float(os.getenv("ASR_COMMAND_THRESHOLD", -0.2))
@@ -1171,6 +1176,7 @@ class VADAudio:
 
             auto_active_prev = True
             speech_prob = _vad_model.process(chunk_flat)
+            silence_wait_ms = SILENCE_WAIT_MS.get(SILENCE_WAIT, SILENCE_WAIT_MS["normal"])
 
             if triggered:
                 speech_buffer.append(chunk_flat)
@@ -1179,13 +1185,13 @@ class VADAudio:
                 else:
                     silence_counter = 0
 
-                if silence_counter > MIN_SILENCE_DURATION_MS:
+                if silence_counter > silence_wait_ms:
                     triggered = False
                     end_context = get_focused_element()
 
                     chunks_per_ms = 1 / 32.0
                     chunks_to_keep = int(5 * chunks_per_ms)
-                    silence_chunks = int(MIN_SILENCE_DURATION_MS * chunks_per_ms)
+                    silence_chunks = int(silence_wait_ms * chunks_per_ms)
                     trim_amount = max(0, silence_chunks - chunks_to_keep)
                     if trim_amount > 0 and trim_amount < len(speech_buffer):
                         speech_buffer = speech_buffer[:-trim_amount]
@@ -1307,6 +1313,12 @@ def parse_args():
         default=os.getenv("OPENAI_WHISPER_PROMPT", ""),
         help="Optional prompt/hint for OpenAI transcription.",
     )
+    parser.add_argument(
+        "--silence-wait",
+        choices=sorted(SILENCE_WAIT_MS),
+        default=SILENCE_WAIT if SILENCE_WAIT in SILENCE_WAIT_MS else "normal",
+        help="AUTO mode silence timeout before ending the current speech chunk.",
+    )
     parser.add_argument("--context", action="store_true", help="Enable Context Engine in AUTO mode.")
     return parser.parse_args()
 
@@ -1371,13 +1383,14 @@ def _cleanup():
 
 
 def main():
-    global SELECTED_LANGUAGE, STT_BACKEND, OPENAI_MODEL, OPENAI_PROMPT, vad_audio
+    global SELECTED_LANGUAGE, STT_BACKEND, OPENAI_MODEL, OPENAI_PROMPT, SILENCE_WAIT, vad_audio
 
     args = parse_args()
     SELECTED_LANGUAGE = args.lang
     STT_BACKEND = args.stt_backend
     OPENAI_MODEL = args.openai_model
     OPENAI_PROMPT = args.openai_prompt
+    SILENCE_WAIT = args.silence_wait
 
     _open_log()
     atexit.register(_cleanup)

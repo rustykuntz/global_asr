@@ -89,6 +89,7 @@ Options:
 - `--lang LANG` (default: `auto`)
 - `--openai-model OPENAI_MODEL` (default: `whisper-1`)
 - `--openai-prompt OPENAI_PROMPT`
+- `--silence-wait {normal,long}` (default: `normal`)
 - `--context` (enable context engine in `AUTO` mode)
 
 Language examples:
@@ -96,8 +97,11 @@ Language examples:
 # Auto-detect language (default)
 python global_asr.py --lang auto
 
-# Force English
+# Start with English
 python global_asr.py --lang en
+
+# Start with English and longer AUTO silence wait
+python global_asr.py --lang en --silence-wait long
 
 # Force Spanish with OpenAI backend
 python global_asr.py --stt-backend openai --lang es
@@ -115,6 +119,7 @@ Common keys:
 - `OPENAI_API_KEY=...`
 - `OPENAI_WHISPER_MODEL=whisper-1`
 - `OPENAI_WHISPER_PROMPT=...`
+- `ASR_SILENCE_WAIT=normal|long`
 - `FASTER_WHISPER_MODEL=small` (optional, Windows local backend)
 - `FASTER_WHISPER_DEVICE=auto` (optional, Windows local backend)
 - `FASTER_WHISPER_COMPUTE_TYPE=int8` (optional, Windows local backend)
