@@ -115,7 +115,7 @@ USER_SPEAKING_THRESHOLD = float(os.getenv("VAD_USER_SPEAKING_THRESHOLD", 0.6))
 SILENCE_WAIT = (os.getenv("ASR_SILENCE_WAIT", "normal") or "normal").strip().lower()
 SILENCE_WAIT_MS = {
     "normal": MIN_SILENCE_DURATION_MS,
-    "long": 4000,
+    "long": 2500,
 }
 
 ASR_DICTATION_THRESHOLD = float(os.getenv("ASR_DICTATION_THRESHOLD", -0.12))

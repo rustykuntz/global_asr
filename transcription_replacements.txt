@@ -27,3 +27,7 @@ Rosy => Rocie | mode=all
 JGPT => ChatGPT | mode=all
 chat GPT => ChatGPT | mode=all
 Chagypt => ChatGPT | mode=all
+
+cloud code => Claude code | mode=all
+
+codecs => codex | mode=all
