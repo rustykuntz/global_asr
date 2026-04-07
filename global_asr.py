@@ -1,11 +1,13 @@
 import argparse
 import atexit
 import collections
+import ctypes
 import json
 import os
 import queue
 import re
 import signal
+import struct
 import subprocess
 import sys
 import tempfile
@@ -16,6 +18,7 @@ from datetime import datetime, timezone
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _ENV_FILE = os.path.join(_SCRIPT_DIR, ".env")
+_FALSE_ENV_VALUES = {"0", "false", "no", "off"}
 
 
 def _read_env_value(path, key):
@@ -36,6 +39,7 @@ def _read_env_value(path, key):
 
 
 def _resolve_venv_python(venv_path):
+    """Returns the venv python path for Windows (Scripts/python.exe) and Unix (bin/python)."""
     venv_path = os.path.abspath(venv_path)
     if sys.platform.startswith("win"):
         return os.path.join(venv_path, "Scripts", "python.exe")
@@ -106,6 +110,23 @@ FASTER_WHISPER_COMPUTE_TYPE = os.getenv(
 
 # Audio and ASR config
 SAMPLE_RATE = 16000
+
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in _FALSE_ENV_VALUES
+
+
+def _env_int_clamped(name, default, minimum, maximum):
+    try:
+        value = int(float(os.getenv(name, default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, int(value)))
+
+
 VAD_POSITIVE_THRESHOLD = float(os.getenv("VAD_POSITIVE_THRESHOLD", 0.3))
 VAD_NEGATIVE_THRESHOLD = float(os.getenv("VAD_NEGATIVE_THRESHOLD", 0.25))
 MIN_SPEECH_DURATION_MS = int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", 400))
@@ -124,6 +145,9 @@ ASR_ENERGY_THRESHOLD = float(os.getenv("ASR_ENERGY_THRESHOLD", -45.6))
 TOOL_INSTRUCTION_DURATION = float(os.getenv("TOOL_INSTRUCTION_DURATION", 2.5))
 ASR_SEND_WINDOW_DURATION_S = float(os.getenv("ASR_SEND_WINDOW_DURATION_S", 5.0))
 MODE_OVERLAY_DURATION_S = max(3.0, min(5.0, float(os.getenv("MODE_OVERLAY_DURATION_S", 4.0))))
+AUDIO_DUCKING_ENABLED = IS_MAC and _env_bool("ASR_DUCK_OUTPUT_AUDIO", True)
+AUDIO_DUCK_OUTPUT_VOLUME = _env_int_clamped("ASR_DUCK_OUTPUT_VOLUME", 0, 0, 100)
+AUDIO_DUCK_FADE_MS = _env_int_clamped("ASR_DUCK_FADE_MS", 180, 0, 2000)
 
 # Context filters (auto mode only)
 DISAPPROVED_APPS = ["Calculator", "System Settings", "Finder"]
@@ -172,6 +196,17 @@ context_engine = None
 # Audio runtime objects
 vad_audio = None
 manual_recording_overlay_proc = None
+_audio_duck_restore_volume = None
+_audio_duck_lock = threading.Lock()
+_audio_toolbox = None
+
+
+class _AudioObjectPropertyAddress(ctypes.Structure):
+    _fields_ = [
+        ("mSelector", ctypes.c_uint32),
+        ("mScope", ctypes.c_uint32),
+        ("mElement", ctypes.c_uint32),
+    ]
 
 # Lazy-loaded backend/runtime dependencies
 _vad_model = None
@@ -314,6 +349,250 @@ def stop_manual_recording_overlay():
         except Exception:
             manual_recording_overlay_proc.kill()
     manual_recording_overlay_proc = None
+
+
+def _coreaudio_fourcc(value):
+    return struct.unpack(">I", value.encode("ascii"))[0]
+
+
+_COREAUDIO_SYSTEM_OBJECT = 1
+_COREAUDIO_MAIN_ELEMENT = 0
+_COREAUDIO_SCOPE_GLOBAL = _coreaudio_fourcc("glob")
+_COREAUDIO_SCOPE_OUTPUT = _coreaudio_fourcc("outp")
+_COREAUDIO_DEFAULT_OUTPUT_DEVICE = _coreaudio_fourcc("dOut")
+_COREAUDIO_DEFAULT_SYSTEM_OUTPUT_DEVICE = _coreaudio_fourcc("sOut")
+_COREAUDIO_VIRTUAL_MAIN_VOLUME = _coreaudio_fourcc("vmvc")
+_COREAUDIO_VOLUME_SCALAR = _coreaudio_fourcc("volm")
+
+
+def _load_audio_toolbox():
+    global _audio_toolbox
+    if _audio_toolbox is not None:
+        return _audio_toolbox
+
+    try:
+        lib = ctypes.CDLL("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox")
+        lib.AudioObjectGetPropertyData.argtypes = [
+            ctypes.c_uint32,
+            ctypes.POINTER(_AudioObjectPropertyAddress),
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        lib.AudioObjectGetPropertyData.restype = ctypes.c_int32
+        lib.AudioHardwareServiceGetPropertyData.argtypes = lib.AudioObjectGetPropertyData.argtypes
+        lib.AudioHardwareServiceGetPropertyData.restype = ctypes.c_int32
+        set_property_argtypes = [
+            ctypes.c_uint32,
+            ctypes.POINTER(_AudioObjectPropertyAddress),
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+        ]
+        lib.AudioObjectSetPropertyData.argtypes = set_property_argtypes
+        lib.AudioObjectSetPropertyData.restype = ctypes.c_int32
+        lib.AudioHardwareServiceSetPropertyData.argtypes = set_property_argtypes
+        lib.AudioHardwareServiceSetPropertyData.restype = ctypes.c_int32
+        _audio_toolbox = lib
+        return _audio_toolbox
+    except Exception as e:
+        log_event("audio_duck_error", action="load_audiotoolbox", error=str(e))
+        return None
+
+
+def _macos_default_output_device():
+    lib = _load_audio_toolbox()
+    if lib is None:
+        return None
+
+    last_status = None
+    for selector in (_COREAUDIO_DEFAULT_OUTPUT_DEVICE, _COREAUDIO_DEFAULT_SYSTEM_OUTPUT_DEVICE):
+        device_id = ctypes.c_uint32(0)
+        size = ctypes.c_uint32(ctypes.sizeof(device_id))
+        address = _AudioObjectPropertyAddress(
+            selector,
+            _COREAUDIO_SCOPE_GLOBAL,
+            _COREAUDIO_MAIN_ELEMENT,
+        )
+        status = lib.AudioObjectGetPropertyData(
+            _COREAUDIO_SYSTEM_OBJECT,
+            ctypes.byref(address),
+            0,
+            None,
+            ctypes.byref(size),
+            ctypes.byref(device_id),
+        )
+        last_status = status
+        if status == 0 and device_id.value != 0:
+            return device_id.value
+
+    log_event(
+        "audio_duck_error",
+        action="default_output_device",
+        status=last_status,
+    )
+    return None
+
+
+def _macos_get_float_property(lib, device_id, address):
+    for getter in (lib.AudioObjectGetPropertyData, lib.AudioHardwareServiceGetPropertyData):
+        volume = ctypes.c_float(0.0)
+        size = ctypes.c_uint32(ctypes.sizeof(volume))
+        status = getter(
+            device_id,
+            ctypes.byref(address),
+            0,
+            None,
+            ctypes.byref(size),
+            ctypes.byref(volume),
+        )
+        if status == 0:
+            return max(0.0, min(1.0, float(volume.value)))
+    return None
+
+
+def _macos_set_float_property(lib, device_id, address, volume):
+    size = ctypes.c_uint32(ctypes.sizeof(volume))
+    for setter in (lib.AudioObjectSetPropertyData, lib.AudioHardwareServiceSetPropertyData):
+        status = setter(
+            device_id,
+            ctypes.byref(address),
+            0,
+            None,
+            size,
+            ctypes.byref(volume),
+        )
+        if status == 0:
+            return True
+    return False
+
+
+def _macos_get_output_volume_scalar():
+    lib = _load_audio_toolbox()
+    device_id = _macos_default_output_device()
+    if lib is None or device_id is None:
+        return None
+
+    for selector, element in (
+        (_COREAUDIO_VIRTUAL_MAIN_VOLUME, _COREAUDIO_MAIN_ELEMENT),
+        (_COREAUDIO_VOLUME_SCALAR, _COREAUDIO_MAIN_ELEMENT),
+        (_COREAUDIO_VOLUME_SCALAR, 1),
+        (_COREAUDIO_VOLUME_SCALAR, 2),
+    ):
+        address = _AudioObjectPropertyAddress(selector, _COREAUDIO_SCOPE_OUTPUT, element)
+        volume = _macos_get_float_property(lib, device_id, address)
+        if volume is not None:
+            return volume
+
+    log_event("audio_duck_error", action="get_volume", device_id=device_id)
+    return None
+
+
+def _get_macos_output_volume():
+    volume = _macos_get_output_volume_scalar()
+    if volume is None:
+        return None
+    return int(round(volume * 100))
+
+
+def _macos_set_output_volume_scalar(volume):
+    lib = _load_audio_toolbox()
+    device_id = _macos_default_output_device()
+    if lib is None or device_id is None:
+        return False
+
+    volume = ctypes.c_float(max(0.0, min(1.0, float(volume))))
+    targets = (
+        (_COREAUDIO_VIRTUAL_MAIN_VOLUME, _COREAUDIO_MAIN_ELEMENT),
+        (_COREAUDIO_VOLUME_SCALAR, _COREAUDIO_MAIN_ELEMENT),
+    )
+    for selector, element in targets:
+        address = _AudioObjectPropertyAddress(selector, _COREAUDIO_SCOPE_OUTPUT, element)
+        if _macos_set_float_property(lib, device_id, address, volume):
+            return True
+
+    set_any_channel = False
+    for element in (1, 2):
+        address = _AudioObjectPropertyAddress(_COREAUDIO_VOLUME_SCALAR, _COREAUDIO_SCOPE_OUTPUT, element)
+        set_channel = _macos_set_float_property(lib, device_id, address, volume)
+        set_any_channel = set_any_channel or set_channel
+    return set_any_channel
+
+
+def _set_macos_output_volume(volume):
+    ok = _macos_set_output_volume_scalar(float(volume) / 100.0)
+    if not ok:
+        log_event("audio_duck_error", action="set_volume", volume=volume)
+    return ok
+
+
+def _fade_macos_output_volume(start_volume, end_volume, duration_ms):
+    start_volume = max(0.0, min(100.0, float(start_volume)))
+    end_volume = max(0.0, min(100.0, float(end_volume)))
+    duration_ms = max(0, int(duration_ms))
+
+    if duration_ms == 0 or abs(start_volume - end_volume) < 0.5:
+        return _set_macos_output_volume(end_volume)
+
+    steps = max(2, min(30, duration_ms // 15))
+    sleep_s = duration_ms / 1000.0 / steps
+    for step in range(1, steps + 1):
+        progress = step / steps
+        eased = progress * progress * (3 - 2 * progress)
+        volume = start_volume + ((end_volume - start_volume) * eased)
+        if not _macos_set_output_volume_scalar(volume / 100.0):
+            log_event("audio_duck_error", action="fade_volume", volume=round(volume, 1))
+            return False
+        if step < steps:
+            time.sleep(sleep_s)
+    return True
+
+
+def duck_output_audio():
+    global _audio_duck_restore_volume
+    if not (IS_MAC and AUDIO_DUCKING_ENABLED):
+        return
+
+    with _audio_duck_lock:
+        if _audio_duck_restore_volume is not None:
+            return
+
+        current_volume = _get_macos_output_volume()
+        if current_volume is None:
+            return
+
+        target_volume = min(current_volume, AUDIO_DUCK_OUTPUT_VOLUME)
+        if not _fade_macos_output_volume(current_volume, target_volume, AUDIO_DUCK_FADE_MS):
+            return
+
+        _audio_duck_restore_volume = current_volume
+        log_event(
+            "audio_ducked",
+            original_volume=current_volume,
+            duck_volume=target_volume,
+            fade_ms=AUDIO_DUCK_FADE_MS,
+        )
+
+
+def restore_output_audio():
+    global _audio_duck_restore_volume
+    if not IS_MAC:
+        return
+
+    with _audio_duck_lock:
+        restore_volume = _audio_duck_restore_volume
+        if restore_volume is None:
+            return
+
+        current_volume = _get_macos_output_volume()
+        if current_volume is None:
+            current_volume = AUDIO_DUCK_OUTPUT_VOLUME
+
+        if _fade_macos_output_volume(current_volume, restore_volume, AUDIO_DUCK_FADE_MS):
+            _audio_duck_restore_volume = None
+            log_event("audio_restored", volume=restore_volume, fade_ms=AUDIO_DUCK_FADE_MS)
 
 
 def ensure_vad_model():
@@ -1045,6 +1324,7 @@ class VADAudio:
         self.manual_buffer = []
         stop_manual_recording_overlay()
         clear_level_meter()
+        restore_output_audio()
         print("Recording cancelled.")
         log_event("recording_cancelled")
         show_overlay_text("CANCELLED", "red")
@@ -1052,6 +1332,7 @@ class VADAudio:
     def start_manual_recording(self):
         self.manual_buffer = []
         self.manual_recording = True
+        duck_output_audio()
         print("Manual recording started.")
         log_event("recording_start")
         start_manual_recording_overlay()
@@ -1064,6 +1345,7 @@ class VADAudio:
         stop_manual_recording_overlay()
         clear_level_meter()
         show_overlay_text("REC STOP", "green")
+        restore_output_audio()
         log_event("recording_stop")
 
         if not self.manual_buffer:
@@ -1319,6 +1601,24 @@ def parse_args():
         default=SILENCE_WAIT if SILENCE_WAIT in SILENCE_WAIT_MS else "normal",
         help="AUTO mode silence timeout before ending the current speech chunk.",
     )
+    parser.add_argument(
+        "--duck-output-audio",
+        action=argparse.BooleanOptionalAction,
+        default=AUDIO_DUCKING_ENABLED,
+        help="macOS only: lower system output volume during manual recording. Use --no-duck-output-audio to disable.",
+    )
+    parser.add_argument(
+        "--duck-output-volume",
+        type=int,
+        default=AUDIO_DUCK_OUTPUT_VOLUME,
+        help="macOS only: output volume percent while manual recording is active.",
+    )
+    parser.add_argument(
+        "--duck-fade-ms",
+        type=int,
+        default=AUDIO_DUCK_FADE_MS,
+        help="macOS only: fade duration in milliseconds for lowering/restoring output audio.",
+    )
     parser.add_argument("--context", action="store_true", help="Enable Context Engine in AUTO mode.")
     return parser.parse_args()
 
@@ -1343,6 +1643,12 @@ def print_startup_intro():
     if IS_WINDOWS:
         print("Windows AUTO mode requires: pip install uiautomation")
     print(f"STT backend: {STT_BACKEND}")
+    if IS_MAC:
+        duck_state = "ON" if AUDIO_DUCKING_ENABLED else "OFF"
+        print(
+            f"Audio ducking: {duck_state} "
+            f"(output volume {AUDIO_DUCK_OUTPUT_VOLUME}, fade {AUDIO_DUCK_FADE_MS}ms)"
+        )
     if STT_BACKEND == "openai":
         print(f"OpenAI model: {OPENAI_MODEL}")
 
@@ -1371,6 +1677,7 @@ def init_optional_context_engine(enable_context):
 
 
 def _cleanup():
+    restore_output_audio()
     stop_manual_recording_overlay()
     cleanup_stale_recording_overlays()
     if context_engine:
@@ -1384,6 +1691,7 @@ def _cleanup():
 
 def main():
     global SELECTED_LANGUAGE, STT_BACKEND, OPENAI_MODEL, OPENAI_PROMPT, SILENCE_WAIT, vad_audio
+    global AUDIO_DUCKING_ENABLED, AUDIO_DUCK_OUTPUT_VOLUME, AUDIO_DUCK_FADE_MS
 
     args = parse_args()
     SELECTED_LANGUAGE = args.lang
@@ -1391,6 +1699,9 @@ def main():
     OPENAI_MODEL = args.openai_model
     OPENAI_PROMPT = args.openai_prompt
     SILENCE_WAIT = args.silence_wait
+    AUDIO_DUCKING_ENABLED = IS_MAC and bool(args.duck_output_audio)
+    AUDIO_DUCK_OUTPUT_VOLUME = max(0, min(100, int(args.duck_output_volume)))
+    AUDIO_DUCK_FADE_MS = max(0, min(2000, int(args.duck_fade_ms)))
 
     _open_log()
     atexit.register(_cleanup)

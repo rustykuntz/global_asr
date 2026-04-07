@@ -90,6 +90,9 @@ Options:
 - `--openai-model OPENAI_MODEL` (default: `whisper-1`)
 - `--openai-prompt OPENAI_PROMPT`
 - `--silence-wait {normal,long}` (default: `normal`)
+- `--duck-output-audio` / `--no-duck-output-audio` (macOS only; default: on)
+- `--duck-output-volume VOLUME` (macOS only; default: `0`)
+- `--duck-fade-ms MS` (macOS only; default: `180`)
 - `--context` (enable context engine in `AUTO` mode)
 
 Language examples:
@@ -124,6 +127,9 @@ Common keys:
 - `FASTER_WHISPER_DEVICE=auto` (optional, Windows local backend)
 - `FASTER_WHISPER_COMPUTE_TYPE=int8` (optional, Windows local backend)
 - `ASR_REPLACEMENTS_FILE=transcription_replacements.txt` (optional)
+- `ASR_DUCK_OUTPUT_AUDIO=1` (macOS only; lower system output volume during manual recording)
+- `ASR_DUCK_OUTPUT_VOLUME=0` (macOS only; volume percent while recording)
+- `ASR_DUCK_FADE_MS=180` (macOS only; fade duration for lowering/restoring output audio)
 - `VAD_*` and `ASR_*` thresholds
 
 ## Custom Word Replacements
