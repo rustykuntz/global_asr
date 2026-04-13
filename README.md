@@ -1,17 +1,29 @@
 # global_asr
 
-`global_asr` is a cross-platform voice input runtime focused on dictation for CLI agents and other LLM workflows. It supports fast manual push-to-talk dictation and safer automatic dictation with context gating.
+`global_asr` is a small runtime for speaking directly into app inputs. You press a key, talk, and the transcription is inserted right where your cursor already is: Terminal, Cursor, WhatsApp, Google Docs, chat boxes, editors, wherever. The point is not to make another note-taking app or another voice recorder. The point is to make voice-to-text feel native inside the software you already use.
 
-## Why this exists
-- Dictate directly into coding assistants, terminals, editors, and chat inputs.
-- Switch between explicit control (`MANUAL`) and hands-free capture (`AUTO`).
-- Reduce accidental inserts with validation in `AUTO` mode.
+It started as a tool for talking to coding agents and other LLM workflows, but it generalizes well to anything with a text field. In `MANUAL` mode it behaves like push-to-talk dictation. In `AUTO` mode it listens with VAD and only inserts when the focused UI context looks safe. On macOS it can also duck system playback while recording, so you do not have to manually pause music or YouTube every time you want to speak. There is also a lightweight replacements system for recurring terms, names, and code words that speech models like to mangle.
+
+## Why this is useful
+- Dictate straight into the current app instead of recording somewhere else first.
+- Keep one hotkey flow across terminals, editors, docs, messengers, and browser text boxes.
+- Choose between explicit start/stop control (`MANUAL`) and hands-free speech segmentation (`AUTO`).
+- Reduce bad inserts in `AUTO` mode with focus validation, confidence checks, and context gating.
+- Smoothly duck playback audio during recording on macOS.
+- Teach the system your recurring corrections with custom replacements.
+
+## What It Does
+- Records from your microphone.
+- Transcribes locally or through OpenAI.
+- Types the result into the focused app.
+- Can send the message directly in some apps when appropriate.
+- Can keep listening continuously in `AUTO` mode.
 
 ## Modes
 - `MANUAL` mode (default):
   - Press `F4` to start recording.
   - Press `F4` again to stop, transcribe, and insert.
-  - No app/field restrictions by design; user is in control.
+  - No app/field restrictions by design. You are driving.
 
 - `AUTO` mode:
   - Uses VAD to segment speech automatically.
