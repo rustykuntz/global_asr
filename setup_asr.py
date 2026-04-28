@@ -1,6 +1,7 @@
 import getpass
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,10 @@ BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 REQ_PATH = BASE_DIR / "requirements.txt"
 WHISPER_DIR = BASE_DIR / "whisper-turbo-mlx"
+WHISPER_CPP_DIR = BASE_DIR / "whisper.cpp"
+WHISPER_CPP_MODEL = "large-v3-turbo"
+WHISPER_CPP_MODEL_PATH = WHISPER_CPP_DIR / "models" / f"ggml-{WHISPER_CPP_MODEL}.bin"
+FASTER_WHISPER_MODEL = "large-v3-turbo"
 DEFAULT_VENV_DIR = BASE_DIR / ".venv"
 
 
@@ -43,12 +48,22 @@ def ask_yes_no(question, default_yes=True):
         print("Please answer y or n.")
 
 
-def run_cmd(cmd):
+def run_cmd(cmd, cwd=None):
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, cwd=cwd, check=True)
         return True
     except subprocess.CalledProcessError:
         return False
+
+
+def print_linux_system_dependency_notes():
+    print("Linux system dependencies:")
+    print("  sudo apt update")
+    print("  sudo apt install -y libportaudio2 git cmake build-essential")
+    print("")
+    print("If sounddevice needs to be rebuilt locally, also install:")
+    print("  sudo apt install -y portaudio19-dev")
+    print("")
 
 
 def venv_python_path(venv_dir: Path) -> Path:
@@ -105,7 +120,7 @@ def warm_local_model_faster_whisper(python_bin):
     try:
         code = (
             "from faster_whisper import WhisperModel\n"
-            "WhisperModel('small', device='auto', compute_type='int8')\n"
+            f"WhisperModel({FASTER_WHISPER_MODEL!r}, device='auto', compute_type='int8')\n"
             "print('faster-whisper model is ready.')\n"
         )
         subprocess.run([str(python_bin), "-c", code], check=True)
@@ -113,6 +128,48 @@ def warm_local_model_faster_whisper(python_bin):
     except Exception as e:
         print(f"Failed to download/load faster-whisper model: {e}")
         return False
+
+
+def ensure_whisper_cpp_linux():
+    missing = [name for name in ("git", "cmake", "bash") if shutil.which(name) is None]
+    if missing:
+        print(f"Missing required command(s) for whisper.cpp setup: {', '.join(missing)}")
+        print("Install them with your system package manager, then re-run setup.")
+        return False
+
+    if not WHISPER_CPP_DIR.exists():
+        print("Cloning whisper.cpp...")
+        if not run_cmd(["git", "clone", "https://github.com/ggml-org/whisper.cpp.git", str(WHISPER_CPP_DIR)]):
+            print("Failed to clone whisper.cpp.")
+            return False
+    else:
+        print(f"Using existing whisper.cpp checkout: {WHISPER_CPP_DIR}")
+
+    cmake_cmd = ["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"]
+    if shutil.which("nvcc"):
+        print("CUDA toolkit detected; building whisper.cpp with GGML_CUDA=ON.")
+        cmake_cmd.append("-DGGML_CUDA=ON")
+    else:
+        print("CUDA toolkit not detected; building whisper.cpp CPU-only.")
+
+    print("Building whisper.cpp...")
+    if not run_cmd(cmake_cmd, cwd=WHISPER_CPP_DIR):
+        print("Failed to configure whisper.cpp with cmake.")
+        return False
+    if not run_cmd(["cmake", "--build", "build", "--parallel", "--config", "Release"], cwd=WHISPER_CPP_DIR):
+        print("Failed to build whisper.cpp.")
+        return False
+
+    if not WHISPER_CPP_MODEL_PATH.exists():
+        print(f"Downloading whisper.cpp model: {WHISPER_CPP_MODEL}")
+        if not run_cmd(["bash", "./models/download-ggml-model.sh", WHISPER_CPP_MODEL], cwd=WHISPER_CPP_DIR):
+            print("Failed to download whisper.cpp model.")
+            return False
+    else:
+        print(f"Using existing whisper.cpp model: {WHISPER_CPP_MODEL_PATH}")
+
+    print("whisper.cpp is ready.")
+    return True
 
 
 def main():
@@ -124,6 +181,8 @@ def main():
     print("ASR Setup")
     print(f"Detected OS: {os_name}")
     print("")
+    if os_name == "Linux":
+        print_linux_system_dependency_notes()
 
     if not using_venv:
         print("Project venv not found.")
@@ -162,25 +221,54 @@ def main():
             ],
             default_index=1,
         )
+    elif os_name == "Linux":
+        backend = ask_choice(
+            "Choose speech backend:",
+            [
+                ("local", "Local Whisper Turbo via whisper.cpp (recommended on Linux)"),
+                ("openai", "OpenAI Whisper API"),
+            ],
+            default_index=1,
+        )
+    elif os_name == "Windows":
+        backend = ask_choice(
+            "Choose speech backend:",
+            [
+                ("openai", "OpenAI Whisper API (recommended)"),
+                ("local", "Local Whisper Turbo via faster-whisper"),
+            ],
+            default_index=1,
+        )
     else:
         backend = ask_choice(
             "Choose speech backend:",
             [
                 ("openai", "OpenAI Whisper API (recommended)"),
-                ("local", "Local Whisper (faster-whisper on Windows)"),
+                ("local", "Local Whisper (unsupported on this OS)"),
             ],
             default_index=1,
         )
 
-    if backend == "local" and os_name not in {"Darwin", "Windows"}:
-        print("Local backend on this OS uses faster-whisper (AUTO mode may still be unsupported).")
-        if not ask_yes_no("Keep local backend anyway?", default_yes=False):
-            backend = "openai"
+    if backend == "local" and os_name not in {"Darwin", "Windows", "Linux"}:
+        print("Local backend is supported on macOS, Windows, and Linux only.")
+        backend = "openai"
 
     updates = {
         "STT_BACKEND": backend,
         "ASR_VENV_PATH": ".venv",
     }
+    if backend == "local" and os_name == "Linux":
+        updates.update(
+            {
+                "WHISPER_CPP_DIR": "whisper.cpp",
+                "WHISPER_CPP_MODEL": WHISPER_CPP_MODEL,
+                "WHISPER_CPP_MODEL_PATH": f"whisper.cpp/models/ggml-{WHISPER_CPP_MODEL}.bin",
+                "WHISPER_CPP_BINARY": "whisper.cpp/build/bin/whisper-cli",
+                "WHISPER_CPP_DEVICE": "0",
+                "WHISPER_CPP_BEAM_SIZE": "1",
+                "WHISPER_CPP_BEST_OF": "1",
+            }
+        )
 
     if backend == "openai":
         while True:
@@ -193,15 +281,17 @@ def main():
     write_env(ENV_PATH, updates)
     print(f"Saved configuration: {ENV_PATH}")
 
-    if backend == "local" and os_name in {"Darwin", "Windows"}:
+    if backend == "local" and os_name in {"Darwin", "Windows", "Linux"}:
         print("")
-        if ask_yes_no("Download local model now?", default_yes=True):
+        if ask_yes_no("Prepare local backend now?", default_yes=True):
             if os_name == "Darwin":
                 ok = warm_local_model_mlx(install_python)
-            else:
+            elif os_name == "Windows":
                 ok = warm_local_model_faster_whisper(install_python)
+            else:
+                ok = ensure_whisper_cpp_linux()
             if not ok:
-                print("Model warmup failed. You can retry later by running setup again.")
+                print("Local backend setup failed. You can retry later by running setup again.")
 
     print("\nSetup complete.")
     print("Run:")

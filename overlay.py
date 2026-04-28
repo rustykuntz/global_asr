@@ -1,4 +1,6 @@
 import os
+import re
+import subprocess
 import sys
 
 
@@ -226,6 +228,194 @@ def _run_windows_overlay():
     root.mainloop()
 
 
+def _run_linux_overlay():
+    import ctypes
+    import time
+
+    is_success, label_text, color = _parse_payload()
+    duration_s = _parse_duration(1.5 if is_success else 2.5)
+    parent_pid = _parse_parent_pid()
+
+    if not os.environ.get("DISPLAY"):
+        return
+
+    try:
+        x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+    except OSError:
+        return
+
+    c_int = ctypes.c_int
+    c_uint = ctypes.c_uint
+    c_ulong = ctypes.c_ulong
+    c_long = ctypes.c_long
+    c_char_p = ctypes.c_char_p
+    c_void_p = ctypes.c_void_p
+
+    class XSetWindowAttributes(ctypes.Structure):
+        _fields_ = [
+            ("background_pixmap", c_ulong),
+            ("background_pixel", c_ulong),
+            ("border_pixmap", c_ulong),
+            ("border_pixel", c_ulong),
+            ("bit_gravity", c_int),
+            ("win_gravity", c_int),
+            ("backing_store", c_int),
+            ("backing_planes", c_ulong),
+            ("backing_pixel", c_ulong),
+            ("save_under", c_int),
+            ("event_mask", c_long),
+            ("do_not_propagate_mask", c_long),
+            ("override_redirect", c_int),
+            ("colormap", c_ulong),
+            ("cursor", c_ulong),
+        ]
+
+    x11.XOpenDisplay.argtypes = [c_char_p]
+    x11.XOpenDisplay.restype = c_void_p
+    x11.XDefaultScreen.argtypes = [c_void_p]
+    x11.XDefaultScreen.restype = c_int
+    x11.XRootWindow.argtypes = [c_void_p, c_int]
+    x11.XRootWindow.restype = c_ulong
+    x11.XDisplayWidth.argtypes = [c_void_p, c_int]
+    x11.XDisplayWidth.restype = c_int
+    x11.XDisplayHeight.argtypes = [c_void_p, c_int]
+    x11.XDisplayHeight.restype = c_int
+    x11.XCreateWindow.argtypes = [
+        c_void_p,
+        c_ulong,
+        c_int,
+        c_int,
+        c_uint,
+        c_uint,
+        c_uint,
+        c_int,
+        c_uint,
+        c_void_p,
+        c_ulong,
+        ctypes.POINTER(XSetWindowAttributes),
+    ]
+    x11.XCreateWindow.restype = c_ulong
+    x11.XCreateGC.argtypes = [c_void_p, c_ulong, c_ulong, c_void_p]
+    x11.XCreateGC.restype = c_void_p
+    x11.XSetForeground.argtypes = [c_void_p, c_void_p, c_ulong]
+    x11.XFillRectangle.argtypes = [c_void_p, c_ulong, c_void_p, c_int, c_int, c_uint, c_uint]
+    x11.XDrawString.argtypes = [c_void_p, c_ulong, c_void_p, c_int, c_int, c_char_p, c_int]
+    x11.XFillArc.argtypes = [c_void_p, c_ulong, c_void_p, c_int, c_int, c_uint, c_uint, c_int, c_int]
+    x11.XDrawLine.argtypes = [c_void_p, c_ulong, c_void_p, c_int, c_int, c_int, c_int]
+    x11.XSetLineAttributes.argtypes = [c_void_p, c_void_p, c_uint, c_int, c_int, c_int]
+    x11.XMapRaised.argtypes = [c_void_p, c_ulong]
+    x11.XRaiseWindow.argtypes = [c_void_p, c_ulong]
+    x11.XStoreName.argtypes = [c_void_p, c_ulong, c_char_p]
+    x11.XFlush.argtypes = [c_void_p]
+    x11.XDestroyWindow.argtypes = [c_void_p, c_ulong]
+    x11.XCloseDisplay.argtypes = [c_void_p]
+
+    display = x11.XOpenDisplay(None)
+    if not display:
+        return
+
+    def active_monitor_geometry(default_w, default_h):
+        try:
+            proc = subprocess.run(
+                ["xrandr", "--listactivemonitors"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if proc.returncode != 0:
+                proc = subprocess.run(
+                    ["xrandr", "--listmonitors"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            for line in proc.stdout.splitlines():
+                # Example: " 0: +*DP-1 2560/621x1440/342+0+0  DP-1"
+                m = re.search(r"\s(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)", line)
+                if m:
+                    width, height, x, y = (int(part) for part in m.groups())
+                    return x, y, width, height
+        except Exception:
+            pass
+        return 0, 0, default_w, default_h
+
+    def pixel(hex_color):
+        return int(hex_color.lstrip("#"), 16)
+
+    try:
+        screen = x11.XDefaultScreen(display)
+        root = x11.XRootWindow(display, screen)
+        display_w = x11.XDisplayWidth(display, screen)
+        display_h = x11.XDisplayHeight(display, screen)
+        mon_x, mon_y, screen_w, screen_h = active_monitor_geometry(display_w, display_h)
+
+        width, height = 220, 58
+        x = mon_x + max(0, screen_w - width - 24)
+        y = mon_y + 24
+
+        attrs = XSetWindowAttributes()
+        attrs.background_pixel = pixel("#1a1a1a")
+        attrs.override_redirect = 1
+
+        InputOutput = 1
+        CopyFromParent = 0
+        CWBackPixel = 1 << 1
+        CWOverrideRedirect = 1 << 9
+        window = x11.XCreateWindow(
+            display,
+            root,
+            x,
+            y,
+            width,
+            height,
+            0,
+            CopyFromParent,
+            InputOutput,
+            None,
+            CWBackPixel | CWOverrideRedirect,
+            ctypes.byref(attrs),
+        )
+        gc = x11.XCreateGC(display, window, 0, None)
+        x11.XStoreName(display, window, b"global_asr overlay")
+
+        fg = pixel("#ffffff")
+        bg = pixel("#1a1a1a")
+        accent = pixel("#e74c3c" if color == "red" else "#2ecc71")
+        text_bytes = label_text.replace("●", "").strip().encode("ascii", errors="replace")
+
+        def draw():
+            x11.XSetForeground(display, gc, bg)
+            x11.XFillRectangle(display, window, gc, 0, 0, width, height)
+            x11.XSetForeground(display, gc, fg)
+            x11.XDrawString(display, window, gc, 14, 34, text_bytes, len(text_bytes))
+            x11.XSetForeground(display, gc, accent)
+            if is_success:
+                x11.XSetLineAttributes(display, gc, 3, 0, 1, 0)
+                x11.XDrawLine(display, window, gc, width - 32, 31, width - 27, 38)
+                x11.XDrawLine(display, window, gc, width - 27, 38, width - 16, 20)
+            else:
+                x11.XFillArc(display, window, gc, width - 28, 22, 12, 12, 0, 360 * 64)
+            x11.XRaiseWindow(display, window)
+            x11.XFlush(display)
+
+        x11.XMapRaised(display, window)
+        draw()
+
+        start = time.monotonic()
+        while True:
+            if duration_s is not None and time.monotonic() - start >= duration_s:
+                break
+            if parent_pid is not None and not _pid_exists(parent_pid):
+                break
+            draw()
+            time.sleep(0.25)
+
+        x11.XDestroyWindow(display, window)
+        x11.XFlush(display)
+    finally:
+        x11.XCloseDisplay(display)
+
+
 def main():
     if sys.platform == "darwin":
         _run_macos_overlay()
@@ -233,6 +423,10 @@ def main():
 
     if sys.platform.startswith("win"):
         _run_windows_overlay()
+        return
+
+    if sys.platform.startswith("linux"):
+        _run_linux_overlay()
         return
 
 

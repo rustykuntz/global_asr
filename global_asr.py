@@ -46,6 +46,12 @@ def _resolve_venv_python(venv_path):
     return os.path.join(venv_path, "bin", "python")
 
 
+def _script_relative_path(path):
+    if os.path.isabs(path):
+        return path
+    return os.path.join(_SCRIPT_DIR, path)
+
+
 def _ensure_venv_active():
     if os.getenv("ASR_SKIP_VENV_REEXEC", "0") == "1":
         return
@@ -87,25 +93,54 @@ def _ensure_venv_active():
 _ensure_venv_active()
 
 import numpy as np
-import sounddevice as sd
 from dotenv import load_dotenv
 from pynput.keyboard import Controller, Key, Listener
+
+try:
+    import sounddevice as sd
+except OSError as e:
+    if sys.platform.startswith("linux") and "PortAudio library not found" in str(e):
+        print("Audio system dependency missing: PortAudio library not found.")
+        print("")
+        print("Install the Linux system package, then run global_asr again:")
+        print("  sudo apt update")
+        print("  sudo apt install -y libportaudio2")
+        print("")
+        print("If your distribution also needs headers for rebuilding sounddevice:")
+        print("  sudo apt install -y portaudio19-dev")
+        raise SystemExit(1) from None
+    raise
 
 load_dotenv(_ENV_FILE)
 GET_FOCUS_BIN = os.path.join(_SCRIPT_DIR, "get_focus")
 OVERLAY_PY = os.path.join(_SCRIPT_DIR, "overlay.py")
 WHISPER_TURBO_DIR = os.path.join(_SCRIPT_DIR, "whisper-turbo-mlx")
+WHISPER_CPP_DIR = os.path.abspath(_script_relative_path(os.getenv("WHISPER_CPP_DIR", "whisper.cpp")))
 TRANSCRIPTION_REPLACEMENTS_FILE = os.getenv("ASR_REPLACEMENTS_FILE", "transcription_replacements.txt")
 if not os.path.isabs(TRANSCRIPTION_REPLACEMENTS_FILE):
     TRANSCRIPTION_REPLACEMENTS_FILE = os.path.join(_SCRIPT_DIR, TRANSCRIPTION_REPLACEMENTS_FILE)
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
-FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "small")
+IS_LINUX = sys.platform.startswith("linux")
+FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "large-v3-turbo")
 FASTER_WHISPER_DEVICE = os.getenv("FASTER_WHISPER_DEVICE", "auto")
 FASTER_WHISPER_COMPUTE_TYPE = os.getenv(
     "FASTER_WHISPER_COMPUTE_TYPE",
     "int8" if IS_WINDOWS else "default",
 )
+WHISPER_CPP_MODEL = os.getenv("WHISPER_CPP_MODEL", "large-v3-turbo")
+WHISPER_CPP_MODEL_PATH = os.getenv(
+    "WHISPER_CPP_MODEL_PATH",
+    os.path.join(WHISPER_CPP_DIR, "models", f"ggml-{WHISPER_CPP_MODEL}.bin"),
+)
+WHISPER_CPP_MODEL_PATH = os.path.abspath(_script_relative_path(WHISPER_CPP_MODEL_PATH))
+WHISPER_CPP_BINARY = os.getenv("WHISPER_CPP_BINARY", "")
+if WHISPER_CPP_BINARY:
+    WHISPER_CPP_BINARY = os.path.abspath(_script_relative_path(WHISPER_CPP_BINARY))
+WHISPER_CPP_THREADS = os.getenv("WHISPER_CPP_THREADS", "")
+WHISPER_CPP_DEVICE = os.getenv("WHISPER_CPP_DEVICE", "0")
+WHISPER_CPP_BEAM_SIZE = os.getenv("WHISPER_CPP_BEAM_SIZE", "1")
+WHISPER_CPP_BEST_OF = os.getenv("WHISPER_CPP_BEST_OF", "1")
 
 
 # Audio and ASR config
@@ -274,7 +309,7 @@ def log_drop(reason, **data):
 
 
 def show_overlay_text(text, color="green", duration=None, kind=None):
-    if not (IS_MAC or IS_WINDOWS) or not os.path.exists(OVERLAY_PY):
+    if not (IS_MAC or IS_WINDOWS or IS_LINUX) or not os.path.exists(OVERLAY_PY):
         return None
     try:
         cmd = [
@@ -297,7 +332,7 @@ def show_overlay_text(text, color="green", duration=None, kind=None):
 
 
 def show_overlay_success():
-    if not (IS_MAC or IS_WINDOWS) or not os.path.exists(OVERLAY_PY):
+    if not (IS_MAC or IS_WINDOWS or IS_LINUX) or not os.path.exists(OVERLAY_PY):
         return
     try:
         subprocess.Popen([sys.executable, OVERLAY_PY, "--success"])
@@ -311,7 +346,7 @@ def show_mode_overlay(text, color):
 
 def cleanup_stale_recording_overlays():
     # Best-effort cleanup for stale REC overlays from prior runs.
-    if not IS_MAC:
+    if not (IS_MAC or IS_LINUX):
         return
     try:
         subprocess.run(
@@ -689,6 +724,33 @@ def ensure_vad_model():
         return False
 
 
+def _resolve_whisper_cpp_binary():
+    if WHISPER_CPP_BINARY:
+        return WHISPER_CPP_BINARY
+
+    candidates = [
+        os.path.join(WHISPER_CPP_DIR, "build", "bin", "whisper-cli"),
+        os.path.join(WHISPER_CPP_DIR, "build", "bin", "Release", "whisper-cli"),
+        os.path.join(WHISPER_CPP_DIR, "main"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return candidates[0]
+
+
+def _whisper_cpp_threads_arg():
+    if WHISPER_CPP_THREADS:
+        try:
+            threads = int(WHISPER_CPP_THREADS)
+        except ValueError:
+            threads = 0
+    else:
+        cpu_count = os.cpu_count() or 2
+        threads = max(1, min(8, cpu_count - 1))
+    return str(threads) if threads > 0 else None
+
+
 def ensure_local_backend():
     global _local_transcribe, _local_load_model, _local_backend_kind, _local_backend_obj
     if _local_transcribe is not None and _local_load_model is not None and _local_backend_kind is not None:
@@ -713,11 +775,103 @@ def ensure_local_backend():
         _local_backend_kind = "mlx"
         return True
 
+    if IS_LINUX:
+        whisper_cpp_binary = _resolve_whisper_cpp_binary()
+        whisper_cpp_model_path = os.path.abspath(WHISPER_CPP_MODEL_PATH)
+
+        if not os.path.isfile(whisper_cpp_binary):
+            print(f"Error: whisper.cpp binary not found: {whisper_cpp_binary}")
+            print("Run setup again and choose the local backend to clone/build whisper.cpp.")
+            return False
+        if not os.path.isfile(whisper_cpp_model_path):
+            print(f"Error: whisper.cpp model not found: {whisper_cpp_model_path}")
+            print("Run setup again and choose the local backend to download the ggml model.")
+            return False
+
+        print(
+            "Using local whisper.cpp backend "
+            f"(model={os.path.basename(whisper_cpp_model_path)}, "
+            f"device={WHISPER_CPP_DEVICE or 'default'}, "
+            f"threads={_whisper_cpp_threads_arg() or 'default'}, "
+            f"beam={WHISPER_CPP_BEAM_SIZE or 'default'}, "
+            f"best_of={WHISPER_CPP_BEST_OF or 'default'})"
+        )
+
+        def local_load_model():
+            return {
+                "binary": whisper_cpp_binary,
+                "model": whisper_cpp_model_path,
+            }
+
+        def local_transcribe(path_audio, lang):
+            tmp_base = None
+            try:
+                fd, tmp_base = tempfile.mkstemp(prefix="global_asr_whisper_cpp_")
+                os.close(fd)
+                os.remove(tmp_base)
+
+                cmd = [
+                    whisper_cpp_binary,
+                    "-m",
+                    whisper_cpp_model_path,
+                    "-f",
+                    path_audio,
+                    "-otxt",
+                    "-of",
+                    tmp_base,
+                    "-nt",
+                    "-np",
+                ]
+                threads = _whisper_cpp_threads_arg()
+                if threads:
+                    cmd.extend(["-t", threads])
+                cmd.extend(["-l", lang if lang else "auto"])
+                if WHISPER_CPP_DEVICE:
+                    cmd.extend(["-dev", WHISPER_CPP_DEVICE])
+                if WHISPER_CPP_BEAM_SIZE:
+                    cmd.extend(["-bs", WHISPER_CPP_BEAM_SIZE])
+                if WHISPER_CPP_BEST_OF:
+                    cmd.extend(["-bo", WHISPER_CPP_BEST_OF])
+
+                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+                if proc.returncode != 0:
+                    details = (proc.stderr or proc.stdout or "").strip()
+                    print(f"Error running whisper.cpp: {details}")
+                    return {"text": "", "avg_logprob": None, "language": "unknown"}
+
+                txt_path = f"{tmp_base}.txt"
+                if os.path.exists(txt_path):
+                    with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
+                        text = f.read().strip()
+                else:
+                    text = (proc.stdout or "").strip()
+
+                return {
+                    "text": text,
+                    "avg_logprob": None,
+                    "language": lang if lang and lang != "auto" else "unknown",
+                }
+            finally:
+                if tmp_base:
+                    for suffix in ("", ".txt"):
+                        path = f"{tmp_base}{suffix}"
+                        if os.path.exists(path):
+                            os.remove(path)
+
+        _local_transcribe = local_transcribe
+        _local_load_model = local_load_model
+        _local_backend_kind = "whisper_cpp"
+        return True
+
+    if not IS_WINDOWS:
+        print("Error: local backend is supported on macOS (MLX), Windows (faster-whisper), and Linux (whisper.cpp).")
+        return False
+
     try:
         from faster_whisper import WhisperModel
     except ImportError:
         print(
-            "Error: faster-whisper is required for local backend on Windows/non-macOS. "
+            "Error: faster-whisper is required for local backend on Windows. "
             "Install: pip install faster-whisper"
         )
         return False
@@ -788,7 +942,7 @@ def transcribe_audio_local(audio_data):
         return None
 
     _local_load_model()
-    if _local_backend_kind == "faster_whisper":
+    if _local_backend_kind in {"faster_whisper", "whisper_cpp"}:
         tmp_path = write_temp_wav(audio_data)
         try:
             result = _local_transcribe(path_audio=tmp_path, lang=SELECTED_LANGUAGE)
