@@ -267,6 +267,11 @@ def main():
                 "WHISPER_CPP_DEVICE": "0",
                 "WHISPER_CPP_BEAM_SIZE": "1",
                 "WHISPER_CPP_BEST_OF": "1",
+                "WHISPER_CPP_TEMPERATURE": "0",
+                "WHISPER_CPP_TEMPERATURE_INC": "0",
+                "WHISPER_CPP_MAX_CONTEXT": "0",
+                "WHISPER_CPP_NO_FALLBACK": "1",
+                "WHISPER_CPP_SUPPRESS_NST": "1",
             }
         )
 

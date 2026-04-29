@@ -112,6 +112,15 @@ except OSError as e:
     raise
 
 load_dotenv(_ENV_FILE)
+
+
+def _env_bool(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in _FALSE_ENV_VALUES
+
+
 GET_FOCUS_BIN = os.path.join(_SCRIPT_DIR, "get_focus")
 OVERLAY_PY = os.path.join(_SCRIPT_DIR, "overlay.py")
 WHISPER_TURBO_DIR = os.path.join(_SCRIPT_DIR, "whisper-turbo-mlx")
@@ -141,17 +150,15 @@ WHISPER_CPP_THREADS = os.getenv("WHISPER_CPP_THREADS", "")
 WHISPER_CPP_DEVICE = os.getenv("WHISPER_CPP_DEVICE", "0")
 WHISPER_CPP_BEAM_SIZE = os.getenv("WHISPER_CPP_BEAM_SIZE", "1")
 WHISPER_CPP_BEST_OF = os.getenv("WHISPER_CPP_BEST_OF", "1")
+WHISPER_CPP_TEMPERATURE = os.getenv("WHISPER_CPP_TEMPERATURE", "0")
+WHISPER_CPP_TEMPERATURE_INC = os.getenv("WHISPER_CPP_TEMPERATURE_INC", "0")
+WHISPER_CPP_MAX_CONTEXT = os.getenv("WHISPER_CPP_MAX_CONTEXT", "0")
+WHISPER_CPP_NO_FALLBACK = _env_bool("WHISPER_CPP_NO_FALLBACK", True)
+WHISPER_CPP_SUPPRESS_NST = _env_bool("WHISPER_CPP_SUPPRESS_NST", True)
 
 
 # Audio and ASR config
 SAMPLE_RATE = 16000
-
-
-def _env_bool(name, default=False):
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in _FALSE_ENV_VALUES
 
 
 def _env_int_clamped(name, default, minimum, maximum):
@@ -794,7 +801,10 @@ def ensure_local_backend():
             f"device={WHISPER_CPP_DEVICE or 'default'}, "
             f"threads={_whisper_cpp_threads_arg() or 'default'}, "
             f"beam={WHISPER_CPP_BEAM_SIZE or 'default'}, "
-            f"best_of={WHISPER_CPP_BEST_OF or 'default'})"
+            f"best_of={WHISPER_CPP_BEST_OF or 'default'}, "
+            f"temperature={WHISPER_CPP_TEMPERATURE or 'default'}, "
+            f"fallback={'off' if WHISPER_CPP_NO_FALLBACK else 'on'}, "
+            f"context={WHISPER_CPP_MAX_CONTEXT or 'default'})"
         )
 
         def local_load_model():
@@ -832,6 +842,16 @@ def ensure_local_backend():
                     cmd.extend(["-bs", WHISPER_CPP_BEAM_SIZE])
                 if WHISPER_CPP_BEST_OF:
                     cmd.extend(["-bo", WHISPER_CPP_BEST_OF])
+                if WHISPER_CPP_TEMPERATURE:
+                    cmd.extend(["-tp", WHISPER_CPP_TEMPERATURE])
+                if WHISPER_CPP_TEMPERATURE_INC:
+                    cmd.extend(["-tpi", WHISPER_CPP_TEMPERATURE_INC])
+                if WHISPER_CPP_MAX_CONTEXT:
+                    cmd.extend(["-mc", WHISPER_CPP_MAX_CONTEXT])
+                if WHISPER_CPP_NO_FALLBACK:
+                    cmd.append("-nf")
+                if WHISPER_CPP_SUPPRESS_NST:
+                    cmd.append("-sns")
 
                 proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
                 if proc.returncode != 0:
