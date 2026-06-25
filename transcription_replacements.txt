@@ -29,5 +29,31 @@ chat GPT => ChatGPT | mode=all
 Chagypt => ChatGPT | mode=all
 
 cloud code => Claude code | mode=all
+CloudCode => Claude code | mode=all
 
 codecs => codex | mode=all
+
+klideck => Clideck | mode=all
+Klidec => Clideck | mode=all
+CLI deck => Clideck | mode=all
+CLIDEC => Clideck | mode=all
+CLIDEQ => Clideck | mode=all
+CLI-DEC => Clideck | mode=all
+
+LAMAS CPP => llama.cpp | mode=all
+LAMA CPP => llama.cpp | mode=all
+lama si pi pi => llama.cpp | mode=all
+
+
+Cap Hub => caphub | mode=all
+KabHub => caphub | mode=all
+cab hub => caphub | mode=all
+CAPAB => caphub | mode=all
+Kappa => caphub | mode=all
+CrabHub => caphub | mode=all
+CAPA => caphub | mode=all
+upup.io => caphub.io | mode=all
+CapApp => caphub | mode=all
+CarPub => caphub | mode=all
+kaphab => caphub | mode=all
+CapUp => caphub | mode=all

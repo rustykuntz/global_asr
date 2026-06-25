@@ -169,6 +169,7 @@ def _env_int_clamped(name, default, minimum, maximum):
     return max(minimum, min(maximum, int(value)))
 
 
+WHISPER_TURBO_WITHOUT_TIMESTAMPS = _env_bool("WHISPER_TURBO_WITHOUT_TIMESTAMPS", True)
 VAD_POSITIVE_THRESHOLD = float(os.getenv("VAD_POSITIVE_THRESHOLD", 0.3))
 VAD_NEGATIVE_THRESHOLD = float(os.getenv("VAD_NEGATIVE_THRESHOLD", 0.25))
 MIN_SPEECH_DURATION_MS = int(os.getenv("VAD_MIN_SPEECH_DURATION_MS", 400))
@@ -970,7 +971,11 @@ def transcribe_audio_local(audio_data):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
     else:
-        result = _local_transcribe(path_audio=audio_data, lang=SELECTED_LANGUAGE)
+        result = _local_transcribe(
+            path_audio=audio_data,
+            lang=SELECTED_LANGUAGE,
+            without_timestamps=WHISPER_TURBO_WITHOUT_TIMESTAMPS,
+        )
 
     text = str(result.get("text", "")).strip()
     avg_logprob = result.get("avg_logprob")
@@ -979,6 +984,8 @@ def transcribe_audio_local(audio_data):
         "text": text,
         "avg_logprob": avg_logprob,
         "language": detected_lang,
+        "no_speech_prob": result.get("no_speech_prob"),
+        "compression_ratio": result.get("compression_ratio"),
     }
 
 
@@ -1200,7 +1207,6 @@ def get_best_input_device():
 
 def clean_text(text):
     text = re.sub(r"(?i)\s*Продолжение следует\.{3}.*$", "", text)
-    text = re.sub(r"(?i)\s*Thank you[\.!]*\s*$", "", text)
     text = text.strip()
 
     lower_text = text.lower()
@@ -1400,6 +1406,8 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
             raw_text = str(result.get("text", "")).strip()
             text = apply_transcription_replacements(clean_text(raw_text))
             avg_logprob = result.get("avg_logprob")
+            no_speech_prob = result.get("no_speech_prob")
+            compression = result.get("compression_ratio")
 
             if not text or text.lower() == "you":
                 log_drop("garbage_text", raw_text=raw_text, avg_logprob=avg_logprob, duration=round(duration, 2))
@@ -1467,6 +1475,8 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
                 text=action_payload,
                 duration=round(duration, 2),
                 avg_logprob=avg_logprob,
+                no_speech_prob=no_speech_prob,
+                compression_ratio=compression,
                 inference_time=round(inference_time, 2),
                 app=start_app,
             )

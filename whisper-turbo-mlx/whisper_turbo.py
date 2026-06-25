@@ -1,5 +1,6 @@
 import base64
 import glob
+import gzip
 import json
 import math
 import os
@@ -46,6 +47,20 @@ LANGUAGES_KEYS = [
     "ht", "ps", "tk", "nn", "mt", "sa", "lb", "my", "bo", "tl",
     "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw", "su", "yue"
 ]
+
+EOT_TOKEN = 50257
+SOT_TOKEN = 50258
+TRANSCRIBE_TOKEN = 50360
+NO_SPEECH_TOKEN = 50363
+NO_TIMESTAMPS_TOKEN = 50364
+TIMESTAMP_BEGIN_TOKEN = 50365
+
+
+def compression_ratio(text):
+    text_bytes = text.encode("utf-8")
+    if not text_bytes:
+        return 0.0
+    return len(text_bytes) / max(1, len(gzip.compress(text_bytes)))
 
 def load_audio(file, sr=16000):
     try:
@@ -227,7 +242,8 @@ class Transcriber(nn.Module):
         self.model = Whisper(cfg)
         self.tokenizer = Tokenizer()
         self.len_sot = 0
-    def __call__(self, path_audio, lang="auto", any_lang=None, quick=False):
+
+    def __call__(self, path_audio, lang="auto", any_lang=None, quick=False, without_timestamps=True):
         raw = log_mel_spectrogram(path_audio).astype(mx.float16)
         
         # Backward compatibility for any_lang boolean
@@ -248,11 +264,22 @@ class Transcriber(nn.Module):
         
         lang_idx = LANGUAGES_KEYS.index(lang)
         lang_token = 50259 + lang_idx
-        sot = mx.array([[50258, lang_token, 50360, 50365]])
+        timestamp_mode_token = NO_TIMESTAMPS_TOKEN if without_timestamps else TIMESTAMP_BEGIN_TOKEN
+        sot = mx.array([[SOT_TOKEN, lang_token, TRANSCRIBE_TOKEN, timestamp_mode_token]])
 
         self.len_sot = sot.shape[-1]
-        txt, avg_logprob = self.parallel(raw, sot) if quick else self.recurrent(raw, sot)
-        return {"text": txt, "avg_logprob": avg_logprob, "language": lang}
+        if quick:
+            txt, avg_logprob, no_speech_prob = self.parallel(raw, sot, without_timestamps=without_timestamps)
+        else:
+            txt, avg_logprob, no_speech_prob = self.recurrent(raw, sot, without_timestamps=without_timestamps)
+
+        return {
+            "text": txt,
+            "avg_logprob": avg_logprob,
+            "language": lang,
+            "no_speech_prob": no_speech_prob,
+            "compression_ratio": compression_ratio(txt),
+        }
 
     def detect_language(self, raw):
         # Take first 30s (3000 frames) or less
@@ -263,7 +290,7 @@ class Transcriber(nn.Module):
         audio_features = self.model.encode(segment)
         
         # Decode [SOT]
-        sot = mx.array([[50258]])
+        sot = mx.array([[SOT_TOKEN]])
         logits, _, _ = self.model.decode(txt=sot, mel=audio_features, kv_cache=None)
         
         # logits: (1, 1, vocab) -> Take last token logits
@@ -276,39 +303,58 @@ class Transcriber(nn.Module):
         
         return LANGUAGES_KEYS[best_lang_idx]
 
-    def recurrent(self, raw, sot):
+    def recurrent(self, raw, sot, without_timestamps=True):
         new_tok, i = mx.zeros((1,0), dtype=mx.int32), 0
         total_logprob = 0.0
         total_tokens = 0
+        max_no_speech_prob = 0.0
         
         while i+3000 < len(raw):
-            piece, logprob = self.step(raw[i:i+3000][None], sot)
+            piece, logprob, no_speech_prob = self.step(
+                raw[i:i+3000][None],
+                sot,
+                without_timestamps=without_timestamps,
+            )
             
             # Accumulate logprobs (simplified for single segment)
             total_logprob += logprob
             total_tokens += piece.shape[1]
+            max_no_speech_prob = max(max_no_speech_prob, no_speech_prob or 0.0)
+
+            if without_timestamps:
+                new_tok = mx.concatenate([new_tok, piece], axis=-1)
+                i += 3000
+                continue
             
             arg_hop = mx.argmax(piece).item()
-            hop = (piece[:,arg_hop].astype(mx.int32).item()-50365)*2
+            hop = (piece[:,arg_hop].astype(mx.int32).item()-TIMESTAMP_BEGIN_TOKEN)*2
             new_tok = mx.concatenate([new_tok, piece[:,:arg_hop]], axis=-1)
             i += hop if hop > 0 else 3000
             
-        new_tok = [i for i in new_tok.astype(mx.int32).tolist()[0] if i < 50257]
+        new_tok = [i for i in new_tok.astype(mx.int32).tolist()[0] if i < EOT_TOKEN]
         avg_logprob = total_logprob / max(1, total_tokens)
-        return self.tokenizer.decode(new_tok)[0], avg_logprob
+        return self.tokenizer.decode(new_tok)[0], avg_logprob, max_no_speech_prob
 
-    def parallel(self, raw, sot):
+    def parallel(self, raw, sot, without_timestamps=True):
         raw = raw[:(raw.shape[0]//3000)*3000].reshape(-1, 3000, 128)
         assert raw.shape[0] < 360
         sot = mx.repeat(sot, raw.shape[0], 0)
-        new_tok, avg_logprob = self.step(raw, sot)
+        new_tok, avg_logprob, no_speech_prob = self.step(
+            raw,
+            sot,
+            without_timestamps=without_timestamps,
+        )
+
+        if without_timestamps:
+            new_tok = [i for i in sum(new_tok.astype(mx.int32).tolist(), []) if i < EOT_TOKEN]
+            return self.tokenizer.decode(new_tok)[0], avg_logprob, no_speech_prob
         
         arg_hop = mx.argmax(new_tok, axis=-1).tolist()
         new_tok = [i[:a] for i,a in zip(new_tok.astype(mx.int32).tolist(),arg_hop)]
-        new_tok = [i for i in sum(new_tok, []) if i < 50257]
-        return self.tokenizer.decode(new_tok)[0], avg_logprob
+        new_tok = [i for i in sum(new_tok, []) if i < EOT_TOKEN]
+        return self.tokenizer.decode(new_tok)[0], avg_logprob, no_speech_prob
 
-    def step(self, mel, txt):
+    def step(self, mel, txt, without_timestamps=True):
         mel = self.model.encode(mel)
         kv_cache = None
         B = mel.shape[0]
@@ -317,31 +363,40 @@ class Transcriber(nn.Module):
         
         accumulated_logprob = 0.0
         token_count = 0
+        no_speech_prob = None
         
         for i in range(449-self.len_sot):
             logits, kv_cache, _ = self.model.decode(txt=txt, mel=mel, kv_cache=kv_cache)
+            next_logits = logits[:,-1,:]
+
+            raw_logprobs = nn.log_softmax(next_logits, axis=-1)
+            if no_speech_prob is None:
+                no_speech_prob = mx.mean(mx.exp(raw_logprobs[:, NO_SPEECH_TOKEN])).item()
+
+            if without_timestamps:
+                special_mask = mx.arange(next_logits.shape[-1]) >= SOT_TOKEN
+                next_logits = mx.where(special_mask[None, :], -float("inf"), next_logits)
             
             # Calculate logprobs
-            logprobs = nn.log_softmax(logits[:,-1,:], axis=-1)
+            logprobs = nn.log_softmax(next_logits, axis=-1)
             
-            txt = mx.argmax(logits[:,-1,:], axis=-1, keepdims=True) * goon
+            txt = mx.argmax(next_logits, axis=-1, keepdims=True) * goon
             mx.eval(txt)
             
             # Get logprob of selected token
             # We need to gather the logprob corresponding to the selected index
-            # MLX doesn't have gather easily in this context, but we can do it via indexing if batch size is small (it is)
             # Simplified: just take max logprob since we are doing argmax
             selected_logprob = mx.max(logprobs, axis=-1)
-            accumulated_logprob += selected_logprob.item() # Taking item() assumes B=1 mostly
+            accumulated_logprob += mx.mean(selected_logprob).item()
             token_count += 1
             
-            goon *= (txt != 50257)
+            goon *= (txt != EOT_TOKEN)
             new_tok = mx.concatenate([new_tok, txt], axis=-1)
             if goon.sum() <= 0:
                 break
                 
         avg = accumulated_logprob / max(1, token_count)
-        return new_tok, avg
+        return new_tok, avg, no_speech_prob
 
 MODEL_CACHE = None
 
@@ -361,11 +416,17 @@ def load_model():
     MODEL_CACHE = model
     return model
 
-def transcribe(path_audio=None, lang="auto", any_lang=None, quick=False):
+def transcribe(path_audio=None, lang="auto", any_lang=None, quick=False, without_timestamps=True):
     if path_audio is None:
         return benchmark()
     model = load_model()
-    return model(path_audio=path_audio, lang=lang, any_lang=any_lang, quick=quick)
+    return model(
+        path_audio=path_audio,
+        lang=lang,
+        any_lang=any_lang,
+        quick=quick,
+        without_timestamps=without_timestamps,
+    )
 
 def benchmark():
     path_hf = snapshot_download(repo_id='JosefAlbers/exurb1a', allow_patterns=["*.mp3"])
