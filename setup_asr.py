@@ -56,14 +56,86 @@ def run_cmd(cmd, cwd=None):
         return False
 
 
+def install_python_dependencies(python_bin, os_name):
+    print("Upgrading pip/setuptools/wheel...")
+    if not run_cmd([python_bin, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"]):
+        print("Failed to upgrade pip/setuptools/wheel.")
+        return False
+
+    ok = run_cmd([
+        python_bin,
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--upgrade-strategy",
+        "eager",
+        "--prefer-binary",
+        "-r",
+        str(REQ_PATH),
+    ])
+    if ok:
+        return True
+
+    print_dependency_failure_help(os_name)
+    return False
+
+
+def python_venv_package_name():
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    return f"python{version}-venv"
+
+
 def print_linux_system_dependency_notes():
+    venv_package = python_venv_package_name()
     print("Linux system dependencies:")
     print("  sudo apt update")
-    print("  sudo apt install -y libportaudio2 git cmake build-essential")
+    print(f"  sudo apt install -y {venv_package} libportaudio2 git cmake build-essential")
+    if venv_package != "python3-venv":
+        print("")
+        print("If your distro does not provide the versioned venv package, try:")
+        print("  sudo apt install -y python3-venv")
     print("")
     print("If sounddevice needs to be rebuilt locally, also install:")
     print("  sudo apt install -y portaudio19-dev")
     print("")
+    print("If any Python package falls back to a source build, also install:")
+    print("  sudo apt install -y rustc cargo")
+    print("")
+
+
+def print_venv_failure_help(os_name):
+    print("Failed to create .venv.")
+    if os_name != "Linux":
+        return
+
+    venv_package = python_venv_package_name()
+    print("")
+    print("On Debian/Ubuntu this usually means ensurepip is missing.")
+    print("Install the venv package for the Python version you are running:")
+    print(f"  sudo apt install -y {venv_package}")
+    if venv_package != "python3-venv":
+        print("")
+        print("If that package is not available, try the generic package:")
+        print("  sudo apt install -y python3-venv")
+    print("")
+    print("Then rerun:")
+    print("  python3 setup_asr.py")
+
+
+def print_dependency_failure_help(os_name):
+    print("Dependency install failed.")
+    if os_name != "Linux":
+        print("Resolve the pip error above, then re-run setup.")
+        return
+
+    print("")
+    print("On fresh Ubuntu/Debian machines, common fixes are:")
+    print("  .venv/bin/python -m pip install --upgrade pip setuptools wheel")
+    print("  sudo apt install -y rustc cargo")
+    print("")
+    print("Then rerun:")
+    print("  python3 setup_asr.py")
 
 
 def venv_python_path(venv_dir: Path) -> Path:
@@ -196,7 +268,7 @@ def main():
         if ask_yes_no("Create .venv now?", default_yes=True):
             ok = run_cmd([sys.executable, "-m", "venv", str(venv_dir)])
             if not ok:
-                print("Failed to create .venv.")
+                print_venv_failure_help(os_name)
                 sys.exit(1)
             using_venv = True
             venv_python = venv_python_path(venv_dir)
@@ -206,9 +278,8 @@ def main():
     install_python = str(venv_python) if using_venv else sys.executable
 
     if ask_yes_no("Install Python dependencies now?", default_yes=True):
-        ok = run_cmd([install_python, "-m", "pip", "install", "-r", str(REQ_PATH)])
+        ok = install_python_dependencies(install_python, os_name)
         if not ok:
-            print("Dependency install failed. Resolve errors, then re-run setup.")
             sys.exit(1)
 
     print("")

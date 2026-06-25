@@ -74,6 +74,11 @@ Platform notes:
 - macOS:
   - `AUTO` mode uses `get_focus`
   - local backend requires MLX stack and typically `ffmpeg`
+- Linux:
+  - install `python3-venv` or the versioned package such as `python3.14-venv`
+  - install `libportaudio2` for microphone capture
+  - install `rustc cargo` only if pip has to build a package from source
+  - `MANUAL` mode works; `AUTO` mode focus validation is not currently supported
 - Windows:
   - `AUTO` mode requires `uiautomation`
   - local backend uses `faster-whisper`
@@ -199,6 +204,14 @@ toolmd => TOOL.md | mode=all
 - Clears stale buffered audio when switching streams.
 
 ## Troubleshooting
+- `ensurepip is not available` while creating `.venv` on Ubuntu/Debian:
+  - install the venv package for your Python, for example `sudo apt install -y python3.14-venv`
+  - if the versioned package is unavailable, try `sudo apt install -y python3-venv`
+  - rerun `python3 setup_asr.py`
+- `can't find Rust compiler` while installing `tiktoken`:
+  - rerun setup after pulling the latest requirements; newer `tiktoken` has Python 3.14 wheels
+  - upgrade pip inside the venv: `.venv/bin/python -m pip install --upgrade pip setuptools wheel`
+  - if pip still builds from source, install Rust: `sudo apt install -y rustc cargo`
 - `OPENAI_API_KEY is required`:
   - set key in `.env` or rerun `setup_asr.py`
 - `AUTO mode unavailable` on Windows:
