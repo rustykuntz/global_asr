@@ -217,6 +217,7 @@ def _parse_key(value, default):
 ACTION_KEY = _parse_key(os.getenv("ASR_ACTION_KEY"), Key.f4)
 MODE_KEY = _parse_key(os.getenv("ASR_MODE_KEY"), Key.f6)
 CANCEL_KEY = _parse_key(os.getenv("ASR_CANCEL_KEY"), Key.esc)
+STOP_KEY = _parse_key(os.getenv("ASR_STOP_KEY"), Key.enter)
 
 # Runtime state
 keyboard_controller = Controller()
@@ -1726,6 +1727,10 @@ def on_press(key):
                 vad_audio.cancel_manual_recording()
             return
 
+        if key == STOP_KEY and MODE == "manual" and vad_audio and vad_audio.manual_recording:
+            vad_audio.stop_manual_recording()
+            return
+
         if key == MODE_KEY:
             toggle_mode()
             return
@@ -1814,6 +1819,7 @@ def print_startup_intro():
     print(f"- {MODE_KEY}: switch mode (AUTO <-> MANUAL)")
     print(f"- {ACTION_KEY} in AUTO: toggle auto listening ON/OFF")
     print(f"- {ACTION_KEY} in MANUAL: start/stop recording")
+    print(f"- {STOP_KEY} in MANUAL: stop recording")
     print(f"- {CANCEL_KEY} in MANUAL: cancel recording")
     print("")
     print("Modes")

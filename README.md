@@ -22,7 +22,7 @@ It started as a tool for talking to coding agents and other LLM workflows, but i
 ## Modes
 - `MANUAL` mode (default):
   - Press `F4` to start recording.
-  - Press `F4` again to stop, transcribe, and insert.
+  - Press `F4` again, or `Enter`, to stop, transcribe, and insert.
   - No app/field restrictions by design. You are driving.
 
 - `AUTO` mode:
@@ -37,12 +37,14 @@ It started as a tool for talking to coding agents and other LLM workflows, but i
 ## Hotkeys
 - `F6`: switch mode (`AUTO` / `MANUAL`)
 - `F4` in `MANUAL`: start/stop recording
+- `Enter` in `MANUAL`: stop current recording
 - `F4` in `AUTO`: toggle auto listening ON/OFF
 - `ESC` in `MANUAL`: cancel current recording
 
 Hotkeys are configurable in `.env`:
 - `ASR_ACTION_KEY` (default: `f4`)
 - `ASR_MODE_KEY` (default: `f6`)
+- `ASR_STOP_KEY` (default: `enter`)
 - `ASR_CANCEL_KEY` (default: `esc`)
 
 Accepted key values:
@@ -143,6 +145,7 @@ Use `.env.example` as a starting point.
 Common keys:
 - `ASR_ACTION_KEY=f4`
 - `ASR_MODE_KEY=f6`
+- `ASR_STOP_KEY=enter`
 - `ASR_CANCEL_KEY=esc`
 - `STT_BACKEND=local|openai`
 - `OPENAI_API_KEY=...`
