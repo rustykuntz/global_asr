@@ -102,7 +102,7 @@ python global_asr.py
 
 ## Setup Flow
 `setup_asr.py` will:
-1. On Debian/Ubuntu, detect missing Python development headers and offer to install the matching package.
+1. On Debian/Ubuntu, detect missing Python development headers and PortAudio, then offer to install the matching packages.
 2. Install dependencies from `requirements.txt`.
 3. Ask you to choose STT backend (`local` or `openai`).
 4. If `openai` is selected, prompt for `OPENAI_API_KEY`.
@@ -220,6 +220,9 @@ toolmd => TOOL.md | mode=all
 - `Python.h: No such file or directory` while installing `evdev`:
   - rerun `python3 setup_asr.py`; setup will offer to install the matching Python development package
   - for Python 3.12, the manual command is `sudo apt install -y python3.12-dev`
+- `PortAudio library not found` while starting Global ASR:
+  - rerun `python3 setup_asr.py`; setup will offer to install `libportaudio2`
+  - the manual command is `sudo apt install -y libportaudio2`
 - `OPENAI_API_KEY is required`:
   - set key in `.env` or rerun `setup_asr.py`
 - `AUTO mode unavailable` on Windows:

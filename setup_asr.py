@@ -107,24 +107,49 @@ def python_runtime_info(python_bin):
     return version, header_path, result.returncode == 0
 
 
-def ensure_linux_python_headers(python_bin):
+def python_library_available(python_bin, library_name):
+    code = (
+        "import ctypes.util, sys\n"
+        "raise SystemExit(0 if ctypes.util.find_library(sys.argv[1]) else 1)\n"
+    )
+    result = subprocess.run(
+        [str(python_bin), "-c", code, library_name],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def ensure_linux_system_dependencies(python_bin):
     version, header_path, headers_available = python_runtime_info(python_bin)
-    if headers_available:
+    portaudio_available = python_library_available(python_bin, "portaudio")
+    if headers_available and portaudio_available:
         return True
 
     print("")
-    print(f"Python development headers are missing ({header_path or 'Python.h not found'}).")
-    print("Linux keyboard support builds evdev locally and requires these headers.")
+    print("Missing Linux system dependencies:")
+    packages = []
+    versioned_package = None
 
-    if not version:
-        print("Could not determine the Python version used by the environment.")
-        return False
+    if not headers_available:
+        print(f"  Python development headers ({header_path or 'Python.h not found'})")
+        print("    Required to build Linux keyboard support (evdev).")
+        if not version:
+            print("Could not determine the Python version used by the environment.")
+            return False
+        versioned_package = f"python{version}-dev"
+        packages.append(versioned_package)
 
-    versioned_package = f"python{version}-dev"
+    if not portaudio_available:
+        print("  PortAudio runtime library")
+        print("    Required for microphone capture (sounddevice).")
+        packages.append("libportaudio2")
+
     apt_get = shutil.which("apt-get")
     if not apt_get:
-        print("Install the Python development headers with your distribution package manager.")
-        print(f"On Debian/Ubuntu the package is usually: {versioned_package}")
+        print("Install these packages with your distribution package manager:")
+        print(f"  {' '.join(packages)}")
         return False
 
     if hasattr(os, "geteuid") and os.geteuid() == 0:
@@ -132,34 +157,42 @@ def ensure_linux_python_headers(python_bin):
     else:
         sudo = shutil.which("sudo")
         if not sudo:
-            print("sudo was not found. Install the headers as root:")
-            print(f"  apt-get install -y {versioned_package}")
+            print("sudo was not found. Install the packages as root:")
+            print(f"  apt-get install -y {' '.join(packages)}")
             return False
         command_prefix = [sudo]
 
-    if not ask_yes_no(f"Install {versioned_package} now?", default_yes=True):
-        print("Python dependencies cannot be built without the development headers.")
+    package_list = " ".join(packages)
+    if not ask_yes_no(f"Install missing packages ({package_list}) now?", default_yes=True):
+        print("Global ASR cannot run until the missing system dependencies are installed.")
         return False
 
     print("Updating apt package metadata...")
     if not run_cmd([*command_prefix, apt_get, "update"]):
         print("apt-get update failed; trying the existing package metadata.")
 
-    candidates = [versioned_package]
-    if versioned_package != "python3-dev":
-        candidates.append("python3-dev")
+    candidates = [packages]
+    if versioned_package and versioned_package != "python3-dev":
+        candidates.append([
+            "python3-dev" if package == versioned_package else package
+            for package in packages
+        ])
 
-    for package in candidates:
-        print(f"Installing {package}...")
-        if not run_cmd([*command_prefix, apt_get, "install", "-y", package]):
+    for candidate_packages in candidates:
+        print(f"Installing {' '.join(candidate_packages)}...")
+        if not run_cmd([*command_prefix, apt_get, "install", "-y", *candidate_packages]):
             continue
-        _, _, headers_available = python_runtime_info(python_bin)
-        if headers_available:
-            print("Python development headers are ready.")
+        _, _, current_headers_available = python_runtime_info(python_bin)
+        current_portaudio_available = python_library_available(python_bin, "portaudio")
+        if current_headers_available and current_portaudio_available:
+            print("Linux system dependencies are ready.")
             return True
 
-    print("The headers were installed, but Python.h is still unavailable to this interpreter.")
-    print(f"Expected header: {header_path or 'unknown'}")
+    print("System dependency installation did not satisfy all requirements.")
+    if not python_runtime_info(python_bin)[2]:
+        print(f"  Python header still missing: {header_path or 'unknown'}")
+    if not python_library_available(python_bin, "portaudio"):
+        print("  PortAudio library is still unavailable.")
     return False
 
 
@@ -363,9 +396,10 @@ def main():
 
     install_python = str(venv_python) if using_venv else sys.executable
 
+    if os_name == "Linux" and not ensure_linux_system_dependencies(install_python):
+        sys.exit(1)
+
     if ask_yes_no("Install Python dependencies now?", default_yes=True):
-        if os_name == "Linux" and not ensure_linux_python_headers(install_python):
-            sys.exit(1)
         ok = install_python_dependencies(install_python, os_name)
         if not ok:
             sys.exit(1)
