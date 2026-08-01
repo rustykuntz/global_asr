@@ -77,6 +77,90 @@ def _parse_payload():
     return is_success, label_text, color
 
 
+def _positive_float(raw):
+    try:
+        value = float(raw)
+        return value if value > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_scale(value):
+    return max(0.75, min(3.0, round(value * 4) / 4))
+
+
+def _linux_overlay_scale(screen_w, screen_h, width_mm=None, height_mm=None):
+    override = _positive_float(os.getenv("ASR_OVERLAY_SCALE"))
+    if override is not None:
+        return _normalized_scale(override)
+
+    gdk_scale = _positive_float(os.getenv("GDK_SCALE"))
+    if gdk_scale is not None:
+        gdk_dpi_scale = _positive_float(os.getenv("GDK_DPI_SCALE")) or 1.0
+        toolkit_scale = gdk_scale * gdk_dpi_scale
+        if toolkit_scale > 1.0:
+            return _normalized_scale(toolkit_scale)
+
+    qt_scale = _positive_float(os.getenv("QT_SCALE_FACTOR"))
+    if qt_scale is not None and qt_scale > 1.0:
+        return _normalized_scale(qt_scale)
+
+    xft_dpi = _positive_float(os.getenv("XFT_DPI"))
+    if xft_dpi is None:
+        try:
+            proc = subprocess.run(
+                ["xrdb", "-query"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            match = re.search(r"(?mi)^Xft\.dpi:\s*([0-9.]+)", proc.stdout)
+            if match:
+                xft_dpi = _positive_float(match.group(1))
+        except Exception:
+            pass
+    if xft_dpi is not None and xft_dpi > 96:
+        return _normalized_scale(xft_dpi / 96.0)
+
+    dpi_values = []
+    if width_mm and width_mm > 0:
+        dpi_values.append(screen_w * 25.4 / width_mm)
+    if height_mm and height_mm > 0:
+        dpi_values.append(screen_h * 25.4 / height_mm)
+    plausible_dpi = [dpi for dpi in dpi_values if 70 <= dpi <= 400]
+    if plausible_dpi:
+        physical_scale = sum(plausible_dpi) / len(plausible_dpi) / 96.0
+        if physical_scale > 1.0:
+            return _normalized_scale(physical_scale)
+
+    if screen_w >= 5000 or screen_h >= 2800:
+        return 2.0
+    if screen_w >= 3200 or screen_h >= 1800:
+        return 1.5
+    return 1.0
+
+
+def _parse_xrandr_monitor_geometry(output):
+    for line in output.splitlines():
+        # Example: " 0: +*DP-1 2560/621x1440/342+0+0  DP-1"
+        match = re.search(
+            r"\s(\d+)(?:/(\d+))?x(\d+)(?:/(\d+))?([+-]\d+)([+-]\d+)",
+            line,
+        )
+        if not match:
+            continue
+        width, width_mm, height, height_mm, x, y = match.groups()
+        return (
+            int(x),
+            int(y),
+            int(width),
+            int(height),
+            int(width_mm) if width_mm else None,
+            int(height_mm) if height_mm else None,
+        )
+    return None
+
+
 def _run_macos_overlay():
     import AppKit
     import objc
@@ -270,6 +354,12 @@ def _run_linux_overlay():
             ("cursor", c_ulong),
         ]
 
+    class XFontStruct(ctypes.Structure):
+        _fields_ = [
+            ("ext_data", c_void_p),
+            ("fid", c_ulong),
+        ]
+
     x11.XOpenDisplay.argtypes = [c_char_p]
     x11.XOpenDisplay.restype = c_void_p
     x11.XDefaultScreen.argtypes = [c_void_p]
@@ -303,6 +393,10 @@ def _run_linux_overlay():
     x11.XFillArc.argtypes = [c_void_p, c_ulong, c_void_p, c_int, c_int, c_uint, c_uint, c_int, c_int]
     x11.XDrawLine.argtypes = [c_void_p, c_ulong, c_void_p, c_int, c_int, c_int, c_int]
     x11.XSetLineAttributes.argtypes = [c_void_p, c_void_p, c_uint, c_int, c_int, c_int]
+    x11.XLoadQueryFont.argtypes = [c_void_p, c_char_p]
+    x11.XLoadQueryFont.restype = ctypes.POINTER(XFontStruct)
+    x11.XSetFont.argtypes = [c_void_p, c_void_p, c_ulong]
+    x11.XFreeFont.argtypes = [c_void_p, ctypes.POINTER(XFontStruct)]
     x11.XMapRaised.argtypes = [c_void_p, c_ulong]
     x11.XRaiseWindow.argtypes = [c_void_p, c_ulong]
     x11.XStoreName.argtypes = [c_void_p, c_ulong, c_char_p]
@@ -329,15 +423,12 @@ def _run_linux_overlay():
                     text=True,
                     check=False,
                 )
-            for line in proc.stdout.splitlines():
-                # Example: " 0: +*DP-1 2560/621x1440/342+0+0  DP-1"
-                m = re.search(r"\s(\d+)/\d+x(\d+)/\d+\+(-?\d+)\+(-?\d+)", line)
-                if m:
-                    width, height, x, y = (int(part) for part in m.groups())
-                    return x, y, width, height
+            geometry = _parse_xrandr_monitor_geometry(proc.stdout)
+            if geometry:
+                return geometry
         except Exception:
             pass
-        return 0, 0, default_w, default_h
+        return 0, 0, default_w, default_h, None, None
 
     def pixel(hex_color):
         return int(hex_color.lstrip("#"), 16)
@@ -347,11 +438,19 @@ def _run_linux_overlay():
         root = x11.XRootWindow(display, screen)
         display_w = x11.XDisplayWidth(display, screen)
         display_h = x11.XDisplayHeight(display, screen)
-        mon_x, mon_y, screen_w, screen_h = active_monitor_geometry(display_w, display_h)
+        mon_x, mon_y, screen_w, screen_h, width_mm, height_mm = active_monitor_geometry(
+            display_w,
+            display_h,
+        )
+        scale = _linux_overlay_scale(screen_w, screen_h, width_mm, height_mm)
 
-        width, height = 220, 58
-        x = mon_x + max(0, screen_w - width - 24)
-        y = mon_y + 24
+        def scaled(value):
+            return max(1, round(value * scale))
+
+        width, height = scaled(220), scaled(58)
+        margin = scaled(24)
+        x = mon_x + max(0, screen_w - width - margin)
+        y = mon_y + margin
 
         attrs = XSetWindowAttributes()
         attrs.background_pixel = pixel("#1a1a1a")
@@ -378,6 +477,27 @@ def _run_linux_overlay():
         gc = x11.XCreateGC(display, window, 0, None)
         x11.XStoreName(display, window, b"global_asr overlay")
 
+        font_px = scaled(14)
+        core_font = None
+        core_font_names = [
+            f"-*-helvetica-bold-r-normal--{font_px}-*-*-*-*-*-iso8859-1",
+            f"-misc-fixed-bold-r-normal--{font_px}-*-*-*-*-*-iso8859-1",
+        ]
+        if font_px >= 23:
+            core_font_names.append("12x24")
+        elif font_px >= 18:
+            core_font_names.append("10x20")
+        elif font_px >= 15:
+            core_font_names.append("9x15bold")
+        else:
+            core_font_names.append("8x13bold")
+        core_font_names.append("fixed")
+        for font_name in core_font_names:
+            core_font = x11.XLoadQueryFont(display, font_name.encode("ascii"))
+            if core_font:
+                x11.XSetFont(display, gc, core_font.contents.fid)
+                break
+
         fg = pixel("#ffffff")
         bg = pixel("#1a1a1a")
         accent = pixel("#e74c3c" if color == "red" else "#2ecc71")
@@ -387,14 +507,49 @@ def _run_linux_overlay():
             x11.XSetForeground(display, gc, bg)
             x11.XFillRectangle(display, window, gc, 0, 0, width, height)
             x11.XSetForeground(display, gc, fg)
-            x11.XDrawString(display, window, gc, 14, 34, text_bytes, len(text_bytes))
+            x11.XDrawString(
+                display,
+                window,
+                gc,
+                scaled(14),
+                scaled(34),
+                text_bytes,
+                len(text_bytes),
+            )
             x11.XSetForeground(display, gc, accent)
             if is_success:
-                x11.XSetLineAttributes(display, gc, 3, 0, 1, 0)
-                x11.XDrawLine(display, window, gc, width - 32, 31, width - 27, 38)
-                x11.XDrawLine(display, window, gc, width - 27, 38, width - 16, 20)
+                x11.XSetLineAttributes(display, gc, scaled(3), 0, 1, 0)
+                x11.XDrawLine(
+                    display,
+                    window,
+                    gc,
+                    width - scaled(32),
+                    scaled(31),
+                    width - scaled(27),
+                    scaled(38),
+                )
+                x11.XDrawLine(
+                    display,
+                    window,
+                    gc,
+                    width - scaled(27),
+                    scaled(38),
+                    width - scaled(16),
+                    scaled(20),
+                )
             else:
-                x11.XFillArc(display, window, gc, width - 28, 22, 12, 12, 0, 360 * 64)
+                dot_size = scaled(12)
+                x11.XFillArc(
+                    display,
+                    window,
+                    gc,
+                    width - scaled(28),
+                    scaled(22),
+                    dot_size,
+                    dot_size,
+                    0,
+                    360 * 64,
+                )
             x11.XRaiseWindow(display, window)
             x11.XFlush(display)
 
@@ -410,6 +565,8 @@ def _run_linux_overlay():
             draw()
             time.sleep(0.25)
 
+        if core_font:
+            x11.XFreeFont(display, core_font)
         x11.XDestroyWindow(display, window)
         x11.XFlush(display)
     finally:

@@ -90,6 +90,7 @@ Platform notes:
   - local backend uses `whisper.cpp`
   - setup requires `libportaudio2`, `git`, `cmake`, and a C/C++ build toolchain
   - Ubuntu/Debian packages: `sudo apt install -y python3-dev libportaudio2 git cmake build-essential`
+  - overlays automatically follow desktop/monitor DPI; set `ASR_OVERLAY_SCALE=1.5` in `.env` to override detection
   - if `nvcc` is available, setup builds `whisper.cpp` with CUDA (`GGML_CUDA=ON`)
   - if `sounddevice` must rebuild locally, also install `portaudio19-dev`
   - `MANUAL` mode works without UI focus integration
