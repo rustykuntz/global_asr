@@ -79,7 +79,8 @@ Platform notes:
 - Linux:
   - install `python3-venv` or the versioned package such as `python3.14-venv`
   - install `libportaudio2` for microphone capture
-  - install `rustc cargo` only if pip has to build a package from source
+  - install the matching Python development package (for example `python3.12-dev`) so Linux keyboard support can build `evdev`
+  - install `rustc cargo` only if pip has to build a Rust-based package from source
   - `MANUAL` mode works; `AUTO` mode focus validation is not currently supported
 - Windows:
   - `AUTO` mode requires `uiautomation`
@@ -88,7 +89,7 @@ Platform notes:
 - Linux:
   - local backend uses `whisper.cpp`
   - setup requires `libportaudio2`, `git`, `cmake`, and a C/C++ build toolchain
-  - Ubuntu/Debian packages: `sudo apt install -y libportaudio2 git cmake build-essential`
+  - Ubuntu/Debian packages: `sudo apt install -y python3-dev libportaudio2 git cmake build-essential`
   - if `nvcc` is available, setup builds `whisper.cpp` with CUDA (`GGML_CUDA=ON`)
   - if `sounddevice` must rebuild locally, also install `portaudio19-dev`
   - `MANUAL` mode works without UI focus integration
@@ -101,11 +102,12 @@ python global_asr.py
 
 ## Setup Flow
 `setup_asr.py` will:
-1. Install dependencies from `requirements.txt`.
-2. Ask you to choose STT backend (`local` or `openai`).
-3. If `openai` is selected, prompt for `OPENAI_API_KEY`.
-4. If `local` is selected, optionally prepare the local model/runtime (macOS MLX, Windows faster-whisper, or Linux whisper.cpp).
-5. Save configuration to `.env`.
+1. On Debian/Ubuntu, detect missing Python development headers and offer to install the matching package.
+2. Install dependencies from `requirements.txt`.
+3. Ask you to choose STT backend (`local` or `openai`).
+4. If `openai` is selected, prompt for `OPENAI_API_KEY`.
+5. If `local` is selected, optionally prepare the local model/runtime (macOS MLX, Windows faster-whisper, or Linux whisper.cpp).
+6. Save configuration to `.env`.
 
 ## Run Options
 ```bash
@@ -215,6 +217,9 @@ toolmd => TOOL.md | mode=all
   - rerun setup after pulling the latest requirements; newer `tiktoken` has Python 3.14 wheels
   - upgrade pip inside the venv: `.venv/bin/python -m pip install --upgrade pip setuptools wheel`
   - if pip still builds from source, install Rust: `sudo apt install -y rustc cargo`
+- `Python.h: No such file or directory` while installing `evdev`:
+  - rerun `python3 setup_asr.py`; setup will offer to install the matching Python development package
+  - for Python 3.12, the manual command is `sudo apt install -y python3.12-dev`
 - `OPENAI_API_KEY is required`:
   - set key in `.env` or rerun `setup_asr.py`
 - `AUTO mode unavailable` on Windows:

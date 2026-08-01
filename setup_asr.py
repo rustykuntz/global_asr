@@ -77,7 +77,7 @@ def install_python_dependencies(python_bin, os_name):
     if ok:
         return True
 
-    print_dependency_failure_help(os_name)
+    print_dependency_failure_help(os_name, python_bin)
     return False
 
 
@@ -86,11 +86,92 @@ def python_venv_package_name():
     return f"python{version}-venv"
 
 
+def python_runtime_info(python_bin):
+    code = (
+        "import pathlib, sys, sysconfig\n"
+        "include = sysconfig.get_path('include') or ''\n"
+        "header = pathlib.Path(include) / 'Python.h'\n"
+        "print(f'{sys.version_info.major}.{sys.version_info.minor}')\n"
+        "print(header)\n"
+        "raise SystemExit(0 if header.is_file() else 1)\n"
+    )
+    result = subprocess.run(
+        [str(python_bin), "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    lines = result.stdout.strip().splitlines()
+    version = lines[0] if lines else None
+    header_path = lines[1] if len(lines) > 1 else None
+    return version, header_path, result.returncode == 0
+
+
+def ensure_linux_python_headers(python_bin):
+    version, header_path, headers_available = python_runtime_info(python_bin)
+    if headers_available:
+        return True
+
+    print("")
+    print(f"Python development headers are missing ({header_path or 'Python.h not found'}).")
+    print("Linux keyboard support builds evdev locally and requires these headers.")
+
+    if not version:
+        print("Could not determine the Python version used by the environment.")
+        return False
+
+    versioned_package = f"python{version}-dev"
+    apt_get = shutil.which("apt-get")
+    if not apt_get:
+        print("Install the Python development headers with your distribution package manager.")
+        print(f"On Debian/Ubuntu the package is usually: {versioned_package}")
+        return False
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        command_prefix = []
+    else:
+        sudo = shutil.which("sudo")
+        if not sudo:
+            print("sudo was not found. Install the headers as root:")
+            print(f"  apt-get install -y {versioned_package}")
+            return False
+        command_prefix = [sudo]
+
+    if not ask_yes_no(f"Install {versioned_package} now?", default_yes=True):
+        print("Python dependencies cannot be built without the development headers.")
+        return False
+
+    print("Updating apt package metadata...")
+    if not run_cmd([*command_prefix, apt_get, "update"]):
+        print("apt-get update failed; trying the existing package metadata.")
+
+    candidates = [versioned_package]
+    if versioned_package != "python3-dev":
+        candidates.append("python3-dev")
+
+    for package in candidates:
+        print(f"Installing {package}...")
+        if not run_cmd([*command_prefix, apt_get, "install", "-y", package]):
+            continue
+        _, _, headers_available = python_runtime_info(python_bin)
+        if headers_available:
+            print("Python development headers are ready.")
+            return True
+
+    print("The headers were installed, but Python.h is still unavailable to this interpreter.")
+    print(f"Expected header: {header_path or 'unknown'}")
+    return False
+
+
 def print_linux_system_dependency_notes():
     venv_package = python_venv_package_name()
+    dev_package = f"python{sys.version_info.major}.{sys.version_info.minor}-dev"
     print("Linux system dependencies:")
     print("  sudo apt update")
-    print(f"  sudo apt install -y {venv_package} libportaudio2 git cmake build-essential")
+    print(
+        f"  sudo apt install -y {venv_package} {dev_package} "
+        "libportaudio2 git cmake build-essential"
+    )
     if venv_package != "python3-venv":
         print("")
         print("If your distro does not provide the versioned venv package, try:")
@@ -99,7 +180,7 @@ def print_linux_system_dependency_notes():
     print("If sounddevice needs to be rebuilt locally, also install:")
     print("  sudo apt install -y portaudio19-dev")
     print("")
-    print("If any Python package falls back to a source build, also install:")
+    print("If a Python package needs a Rust source build, also install:")
     print("  sudo apt install -y rustc cargo")
     print("")
 
@@ -123,15 +204,20 @@ def print_venv_failure_help(os_name):
     print("  python3 setup_asr.py")
 
 
-def print_dependency_failure_help(os_name):
+def print_dependency_failure_help(os_name, python_bin):
     print("Dependency install failed.")
     if os_name != "Linux":
         print("Resolve the pip error above, then re-run setup.")
         return
 
+    version, _, _ = python_runtime_info(python_bin)
+    dev_package = f"python{version}-dev" if version else "python3-dev"
     print("")
     print("On fresh Ubuntu/Debian machines, common fixes are:")
     print("  .venv/bin/python -m pip install --upgrade pip setuptools wheel")
+    print(f"  sudo apt install -y {dev_package}")
+    print("")
+    print("Only Rust-based source builds require:")
     print("  sudo apt install -y rustc cargo")
     print("")
     print("Then rerun:")
@@ -278,6 +364,8 @@ def main():
     install_python = str(venv_python) if using_venv else sys.executable
 
     if ask_yes_no("Install Python dependencies now?", default_yes=True):
+        if os_name == "Linux" and not ensure_linux_python_headers(install_python):
+            sys.exit(1)
         ok = install_python_dependencies(install_python, os_name)
         if not ok:
             sys.exit(1)
