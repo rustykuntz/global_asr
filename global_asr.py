@@ -2,6 +2,7 @@ import argparse
 import atexit
 import collections
 import ctypes
+import glob
 import json
 import os
 import queue
@@ -53,6 +54,29 @@ def _script_relative_path(path):
     return os.path.join(_SCRIPT_DIR, path)
 
 
+def _linux_cuda_library_dirs(venv_path):
+    if not sys.platform.startswith("linux"):
+        return []
+    patterns = [
+        os.path.join(
+            venv_path,
+            "lib",
+            "python*",
+            "site-packages",
+            "nvidia",
+            package,
+            "lib",
+        )
+        for package in ("cublas", "cudnn", "cuda_nvrtc")
+    ]
+    return [
+        path
+        for pattern in patterns
+        for path in sorted(glob.glob(pattern))
+        if os.path.isdir(path)
+    ]
+
+
 def _ensure_venv_active():
     if os.getenv("ASR_SKIP_VENV_REEXEC", "0") == "1":
         return
@@ -76,16 +100,30 @@ def _ensure_venv_active():
     target_prefix = os.path.realpath(configured)
     current_prefix = os.path.realpath(getattr(sys, "prefix", ""))
     env_venv = os.getenv("VIRTUAL_ENV")
+    venv_active = bool(
+        (env_venv and os.path.realpath(env_venv) == target_prefix)
+        or (
+            current_prefix == target_prefix
+            and getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+        )
+    )
 
-    if env_venv and os.path.realpath(env_venv) == target_prefix:
-        return
-
-    # Reliable virtualenv detection; sys.executable can point to the same real binary.
-    if current_prefix == target_prefix and getattr(sys, "base_prefix", sys.prefix) != sys.prefix:
-        return
-
-    print(f"Using project venv interpreter: {venv_python}")
     env = os.environ.copy()
+    needs_reexec = not venv_active
+    cuda_dirs = _linux_cuda_library_dirs(configured)
+    if cuda_dirs:
+        current_dirs = [path for path in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if path]
+        merged_dirs = list(dict.fromkeys([*cuda_dirs, *current_dirs]))
+        merged_library_path = os.pathsep.join(merged_dirs)
+        if env.get("LD_LIBRARY_PATH", "") != merged_library_path:
+            env["LD_LIBRARY_PATH"] = merged_library_path
+            needs_reexec = True
+
+    if not needs_reexec:
+        return
+
+    if not venv_active:
+        print(f"Using project venv interpreter: {venv_python}")
     env["ASR_SKIP_VENV_REEXEC"] = "1"
     script_path = os.path.abspath(sys.argv[0]) if sys.argv else os.path.join(_SCRIPT_DIR, "global_asr.py")
     os.execve(venv_python, [venv_python, script_path, *sys.argv[1:]], env)
@@ -131,7 +169,6 @@ def _env_bool(name, default=False):
 GET_FOCUS_BIN = os.path.join(_SCRIPT_DIR, "get_focus")
 OVERLAY_PY = os.path.join(_SCRIPT_DIR, "overlay.py")
 WHISPER_TURBO_DIR = os.path.join(_SCRIPT_DIR, "whisper-turbo-mlx")
-WHISPER_CPP_DIR = os.path.abspath(_script_relative_path(os.getenv("WHISPER_CPP_DIR", "whisper.cpp")))
 TRANSCRIPTION_REPLACEMENTS_FILE = os.getenv("ASR_REPLACEMENTS_FILE", "transcription_replacements.txt")
 if not os.path.isabs(TRANSCRIPTION_REPLACEMENTS_FILE):
     TRANSCRIPTION_REPLACEMENTS_FILE = os.path.join(_SCRIPT_DIR, TRANSCRIPTION_REPLACEMENTS_FILE)
@@ -140,29 +177,14 @@ IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
 IS_WAYLAND = IS_LINUX and _BOOTSTRAP_WAYLAND
 FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "large-v3-turbo")
-FASTER_WHISPER_DEVICE = os.getenv("FASTER_WHISPER_DEVICE", "auto")
+FASTER_WHISPER_DEVICE = os.getenv(
+    "FASTER_WHISPER_DEVICE",
+    "cuda" if IS_LINUX else "auto",
+)
 FASTER_WHISPER_COMPUTE_TYPE = os.getenv(
     "FASTER_WHISPER_COMPUTE_TYPE",
-    "int8" if IS_WINDOWS else "default",
+    "float16" if IS_LINUX else "int8" if IS_WINDOWS else "default",
 )
-WHISPER_CPP_MODEL = os.getenv("WHISPER_CPP_MODEL", "large-v3-turbo")
-WHISPER_CPP_MODEL_PATH = os.getenv(
-    "WHISPER_CPP_MODEL_PATH",
-    os.path.join(WHISPER_CPP_DIR, "models", f"ggml-{WHISPER_CPP_MODEL}.bin"),
-)
-WHISPER_CPP_MODEL_PATH = os.path.abspath(_script_relative_path(WHISPER_CPP_MODEL_PATH))
-WHISPER_CPP_BINARY = os.getenv("WHISPER_CPP_BINARY", "")
-if WHISPER_CPP_BINARY:
-    WHISPER_CPP_BINARY = os.path.abspath(_script_relative_path(WHISPER_CPP_BINARY))
-WHISPER_CPP_THREADS = os.getenv("WHISPER_CPP_THREADS", "")
-WHISPER_CPP_DEVICE = os.getenv("WHISPER_CPP_DEVICE", "0")
-WHISPER_CPP_BEAM_SIZE = os.getenv("WHISPER_CPP_BEAM_SIZE", "1")
-WHISPER_CPP_BEST_OF = os.getenv("WHISPER_CPP_BEST_OF", "1")
-WHISPER_CPP_TEMPERATURE = os.getenv("WHISPER_CPP_TEMPERATURE", "0")
-WHISPER_CPP_TEMPERATURE_INC = os.getenv("WHISPER_CPP_TEMPERATURE_INC", "0")
-WHISPER_CPP_MAX_CONTEXT = os.getenv("WHISPER_CPP_MAX_CONTEXT", "0")
-WHISPER_CPP_NO_FALLBACK = _env_bool("WHISPER_CPP_NO_FALLBACK", True)
-WHISPER_CPP_SUPPRESS_NST = _env_bool("WHISPER_CPP_SUPPRESS_NST", True)
 
 
 # Audio and ASR config
@@ -177,6 +199,16 @@ def _env_int_clamped(name, default, minimum, maximum):
     return max(minimum, min(maximum, int(value)))
 
 
+FASTER_WHISPER_BEAM_SIZE = _env_int_clamped("FASTER_WHISPER_BEAM_SIZE", 1, 1, 20)
+FASTER_WHISPER_BEST_OF = _env_int_clamped("FASTER_WHISPER_BEST_OF", 1, 1, 20)
+FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT = _env_bool(
+    "FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT",
+    False,
+)
+FASTER_WHISPER_WITHOUT_TIMESTAMPS = _env_bool(
+    "FASTER_WHISPER_WITHOUT_TIMESTAMPS",
+    True,
+)
 WHISPER_TURBO_WITHOUT_TIMESTAMPS = _env_bool("WHISPER_TURBO_WITHOUT_TIMESTAMPS", True)
 VAD_POSITIVE_THRESHOLD = float(os.getenv("VAD_POSITIVE_THRESHOLD", 0.3))
 VAD_NEGATIVE_THRESHOLD = float(os.getenv("VAD_NEGATIVE_THRESHOLD", 0.25))
@@ -997,47 +1029,6 @@ def ensure_vad_model():
         return False
 
 
-def _resolve_whisper_cpp_binary():
-    if WHISPER_CPP_BINARY:
-        return WHISPER_CPP_BINARY
-
-    candidates = [
-        os.path.join(WHISPER_CPP_DIR, "build", "bin", "whisper-cli"),
-        os.path.join(WHISPER_CPP_DIR, "build", "bin", "Release", "whisper-cli"),
-        os.path.join(WHISPER_CPP_DIR, "main"),
-    ]
-    for candidate in candidates:
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return candidates[0]
-
-
-def _whisper_cpp_threads_arg():
-    if WHISPER_CPP_THREADS:
-        try:
-            threads = int(WHISPER_CPP_THREADS)
-        except ValueError:
-            threads = 0
-    else:
-        cpu_count = os.cpu_count() or 2
-        threads = max(1, min(8, cpu_count - 1))
-    return str(threads) if threads > 0 else None
-
-
-def _whisper_cpp_acceleration():
-    cache_path = os.path.join(WHISPER_CPP_DIR, "build", "CMakeCache.txt")
-    try:
-        with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
-            cache = f.read()
-    except OSError:
-        return "unknown"
-    cuda_enabled = any(
-        line.strip() in {"GGML_CUDA:BOOL=ON", "GGML_CUDA:BOOL=1", "GGML_CUDA:BOOL=TRUE"}
-        for line in cache.splitlines()
-    )
-    return "CUDA" if cuda_enabled else "CPU"
-
-
 def _nvidia_gpu_names():
     try:
         proc = subprocess.run(
@@ -1078,126 +1069,47 @@ def ensure_local_backend():
         _local_backend_kind = "mlx"
         return True
 
-    if IS_LINUX:
-        whisper_cpp_binary = _resolve_whisper_cpp_binary()
-        whisper_cpp_model_path = os.path.abspath(WHISPER_CPP_MODEL_PATH)
-        acceleration = _whisper_cpp_acceleration()
-
-        if not os.path.isfile(whisper_cpp_binary):
-            print(f"Error: whisper.cpp binary not found: {whisper_cpp_binary}")
-            print("Run setup again and choose the local backend to clone/build whisper.cpp.")
-            return False
-        if not os.path.isfile(whisper_cpp_model_path):
-            print(f"Error: whisper.cpp model not found: {whisper_cpp_model_path}")
-            print("Run setup again and choose the local backend to download the ggml model.")
-            return False
-
-        gpus = _nvidia_gpu_names()
-        if gpus and acceleration != "CUDA":
-            print("Error: NVIDIA GPU detected, but whisper.cpp is not CUDA-enabled.")
-            print("Run python setup_asr.py and prepare the Linux local backend again.")
-            return False
-
-        print(
-            "Using local whisper.cpp backend "
-            f"(model={os.path.basename(whisper_cpp_model_path)}, "
-            f"acceleration={acceleration}, "
-            f"device={WHISPER_CPP_DEVICE or 'default'}, "
-            f"threads={_whisper_cpp_threads_arg() or 'default'}, "
-            f"beam={WHISPER_CPP_BEAM_SIZE or 'default'}, "
-            f"best_of={WHISPER_CPP_BEST_OF or 'default'}, "
-            f"temperature={WHISPER_CPP_TEMPERATURE or 'default'}, "
-            f"fallback={'off' if WHISPER_CPP_NO_FALLBACK else 'on'}, "
-            f"context={WHISPER_CPP_MAX_CONTEXT or 'default'})"
-        )
-        def local_load_model():
-            return {
-                "binary": whisper_cpp_binary,
-                "model": whisper_cpp_model_path,
-            }
-
-        def local_transcribe(path_audio, lang):
-            tmp_base = None
-            try:
-                fd, tmp_base = tempfile.mkstemp(prefix="global_asr_whisper_cpp_")
-                os.close(fd)
-                os.remove(tmp_base)
-
-                cmd = [
-                    whisper_cpp_binary,
-                    "-m",
-                    whisper_cpp_model_path,
-                    "-f",
-                    path_audio,
-                    "-otxt",
-                    "-of",
-                    tmp_base,
-                    "-nt",
-                    "-np",
-                ]
-                threads = _whisper_cpp_threads_arg()
-                if threads:
-                    cmd.extend(["-t", threads])
-                cmd.extend(["-l", lang if lang else "auto"])
-                if WHISPER_CPP_DEVICE:
-                    cmd.extend(["-dev", WHISPER_CPP_DEVICE])
-                if WHISPER_CPP_BEAM_SIZE:
-                    cmd.extend(["-bs", WHISPER_CPP_BEAM_SIZE])
-                if WHISPER_CPP_BEST_OF:
-                    cmd.extend(["-bo", WHISPER_CPP_BEST_OF])
-                if WHISPER_CPP_TEMPERATURE:
-                    cmd.extend(["-tp", WHISPER_CPP_TEMPERATURE])
-                if WHISPER_CPP_TEMPERATURE_INC:
-                    cmd.extend(["-tpi", WHISPER_CPP_TEMPERATURE_INC])
-                if WHISPER_CPP_MAX_CONTEXT:
-                    cmd.extend(["-mc", WHISPER_CPP_MAX_CONTEXT])
-                if WHISPER_CPP_NO_FALLBACK:
-                    cmd.append("-nf")
-                if WHISPER_CPP_SUPPRESS_NST:
-                    cmd.append("-sns")
-
-                proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-                if proc.returncode != 0:
-                    details = (proc.stderr or proc.stdout or "").strip()
-                    print(f"Error running whisper.cpp: {details}")
-                    return {"text": "", "avg_logprob": None, "language": "unknown"}
-
-                txt_path = f"{tmp_base}.txt"
-                if os.path.exists(txt_path):
-                    with open(txt_path, "r", encoding="utf-8", errors="replace") as f:
-                        text = f.read().strip()
-                else:
-                    text = (proc.stdout or "").strip()
-
-                return {
-                    "text": text,
-                    "avg_logprob": None,
-                    "language": lang if lang and lang != "auto" else "unknown",
-                }
-            finally:
-                if tmp_base:
-                    for suffix in ("", ".txt"):
-                        path = f"{tmp_base}{suffix}"
-                        if os.path.exists(path):
-                            os.remove(path)
-
-        _local_transcribe = local_transcribe
-        _local_load_model = local_load_model
-        _local_backend_kind = "whisper_cpp"
-        return True
-
-    if not IS_WINDOWS:
-        print("Error: local backend is supported on macOS (MLX), Windows (faster-whisper), and Linux (whisper.cpp).")
+    if not (IS_WINDOWS or IS_LINUX):
+        print("Error: local backend is supported on macOS (MLX) and Windows/Linux (faster-whisper).")
         return False
 
     try:
+        import ctranslate2
+        import faster_whisper
         from faster_whisper import WhisperModel
-    except ImportError:
+    except ImportError as e:
         print(
-            "Error: faster-whisper is required for local backend on Windows. "
-            "Install: pip install faster-whisper"
+            "Error: faster-whisper/CTranslate2 is required for the local backend. "
+            "Run python setup_asr.py."
         )
+        print(f"Import error: {e}")
         return False
+
+    if IS_LINUX and FASTER_WHISPER_DEVICE == "auto":
+        print("Error: FASTER_WHISPER_DEVICE=auto is disabled on Linux to prevent silent CPU fallback.")
+        print("Use FASTER_WHISPER_DEVICE=cuda or FASTER_WHISPER_DEVICE=cpu.")
+        return False
+
+    if IS_LINUX and FASTER_WHISPER_DEVICE == "cuda":
+        gpus = _nvidia_gpu_names()
+        if not gpus:
+            print("Error: FASTER_WHISPER_DEVICE=cuda, but nvidia-smi -L reported no GPU.")
+            return False
+        try:
+            cuda_device_count = ctranslate2.get_cuda_device_count()
+        except Exception as e:
+            print(f"Error initializing the CTranslate2 CUDA runtime: {e}")
+            print("Run python setup_asr.py to reinstall the Linux CUDA runtime packages.")
+            return False
+        if cuda_device_count < 1:
+            print("Error: CTranslate2 reported zero CUDA devices; CPU fallback is disabled.")
+            return False
+        print(f"CTranslate2 CUDA devices: {cuda_device_count}")
+
+    print(
+        f"Using faster-whisper {faster_whisper.__version__} / "
+        f"CTranslate2 {ctranslate2.__version__}"
+    )
 
     def local_load_model():
         global _local_backend_obj
@@ -1215,7 +1127,15 @@ def ensure_local_backend():
 
     def local_transcribe(path_audio, lang):
         model = local_load_model()
-        kwargs = {"task": "transcribe", "word_timestamps": False}
+        kwargs = {
+            "task": "transcribe",
+            "word_timestamps": False,
+            "without_timestamps": FASTER_WHISPER_WITHOUT_TIMESTAMPS,
+            "beam_size": FASTER_WHISPER_BEAM_SIZE,
+            "best_of": FASTER_WHISPER_BEST_OF,
+            "temperature": 0.0,
+            "condition_on_previous_text": FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT,
+        }
         if lang and lang != "auto":
             kwargs["language"] = lang
 
@@ -1227,12 +1147,30 @@ def ensure_local_backend():
         logprobs = [lp for lp in logprobs if isinstance(lp, (int, float))]
         avg_logprob = (sum(logprobs) / len(logprobs)) if logprobs else None
 
+        no_speech_values = [getattr(seg, "no_speech_prob", None) for seg in segments]
+        no_speech_values = [value for value in no_speech_values if isinstance(value, (int, float))]
+        no_speech_prob = max(no_speech_values) if no_speech_values else None
+
+        compression_values = [getattr(seg, "compression_ratio", None) for seg in segments]
+        compression_values = [value for value in compression_values if isinstance(value, (int, float))]
+        compression_ratio = max(compression_values) if compression_values else None
+
         detected_lang = getattr(info, "language", "unknown") or "unknown"
         return {
             "text": text,
             "avg_logprob": avg_logprob,
             "language": detected_lang,
+            "no_speech_prob": no_speech_prob,
+            "compression_ratio": compression_ratio,
         }
+
+    if IS_LINUX:
+        try:
+            local_load_model()
+        except Exception as e:
+            print(f"Error loading faster-whisper on {FASTER_WHISPER_DEVICE}: {e}")
+            print("Run python setup_asr.py to repair the local backend.")
+            return False
 
     _local_transcribe = local_transcribe
     _local_load_model = local_load_model
@@ -1265,7 +1203,7 @@ def transcribe_audio_local(audio_data):
         return None
 
     _local_load_model()
-    if _local_backend_kind in {"faster_whisper", "whisper_cpp"}:
+    if _local_backend_kind == "faster_whisper":
         tmp_path = write_temp_wav(audio_data)
         try:
             result = _local_transcribe(path_audio=tmp_path, lang=SELECTED_LANGUAGE)
