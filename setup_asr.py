@@ -4,6 +4,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -121,20 +122,27 @@ def python_library_available(python_bin, library_name):
     return result.returncode == 0
 
 
+def is_wayland_session():
+    return (
+        os.getenv("XDG_SESSION_TYPE", "").lower() == "wayland"
+        or bool(os.getenv("WAYLAND_DISPLAY"))
+    )
+
+
+def root_command_prefix():
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return []
+    sudo = shutil.which("sudo")
+    return [sudo] if sudo else None
+
+
 def ensure_linux_system_dependencies(python_bin):
     version, header_path, headers_available = python_runtime_info(python_bin)
     portaudio_available = python_library_available(python_bin, "portaudio")
-    if headers_available and portaudio_available:
-        return True
-
-    print("")
-    print("Missing Linux system dependencies:")
     packages = []
     versioned_package = None
 
     if not headers_available:
-        print(f"  Python development headers ({header_path or 'Python.h not found'})")
-        print("    Required to build Linux keyboard support (evdev).")
         if not version:
             print("Could not determine the Python version used by the environment.")
             return False
@@ -142,9 +150,36 @@ def ensure_linux_system_dependencies(python_bin):
         packages.append(versioned_package)
 
     if not portaudio_available:
-        print("  PortAudio runtime library")
-        print("    Required for microphone capture (sounddevice).")
         packages.append("libportaudio2")
+
+    command_packages = {
+        "git": "git",
+        "cmake": "cmake",
+        "c++": "build-essential",
+    }
+    for command, package in command_packages.items():
+        if shutil.which(command) is None and package not in packages:
+            packages.append(package)
+
+    if is_wayland_session() and shutil.which("wl-copy") is None:
+        packages.append("wl-clipboard")
+
+    if not packages:
+        return True
+
+    print("")
+    print("Missing Linux system dependencies:")
+    if not headers_available:
+        print(f"  Python development headers ({header_path or 'Python.h not found'})")
+    if not portaudio_available:
+        print("  PortAudio runtime library")
+    if "wl-clipboard" in packages:
+        print("  wl-clipboard (Unicode text insertion on Wayland)")
+    missing_build_packages = [
+        package for package in ("git", "cmake", "build-essential") if package in packages
+    ]
+    if missing_build_packages:
+        print(f"  Build tools: {', '.join(missing_build_packages)}")
 
     apt_get = shutil.which("apt-get")
     if not apt_get:
@@ -152,15 +187,11 @@ def ensure_linux_system_dependencies(python_bin):
         print(f"  {' '.join(packages)}")
         return False
 
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        command_prefix = []
-    else:
-        sudo = shutil.which("sudo")
-        if not sudo:
-            print("sudo was not found. Install the packages as root:")
-            print(f"  apt-get install -y {' '.join(packages)}")
-            return False
-        command_prefix = [sudo]
+    command_prefix = root_command_prefix()
+    if command_prefix is None:
+        print("sudo was not found. Install the packages as root:")
+        print(f"  apt-get install -y {' '.join(packages)}")
+        return False
 
     package_list = " ".join(packages)
     if not ask_yes_no(f"Install missing packages ({package_list}) now?", default_yes=True):
@@ -184,7 +215,9 @@ def ensure_linux_system_dependencies(python_bin):
             continue
         _, _, current_headers_available = python_runtime_info(python_bin)
         current_portaudio_available = python_library_available(python_bin, "portaudio")
-        if current_headers_available and current_portaudio_available:
+        commands_available = all(shutil.which(command) for command in command_packages)
+        wayland_tools_available = not is_wayland_session() or shutil.which("wl-copy")
+        if current_headers_available and current_portaudio_available and commands_available and wayland_tools_available:
             print("Linux system dependencies are ready.")
             return True
 
@@ -193,7 +226,98 @@ def ensure_linux_system_dependencies(python_bin):
         print(f"  Python header still missing: {header_path or 'unknown'}")
     if not python_library_available(python_bin, "portaudio"):
         print("  PortAudio library is still unavailable.")
+    if is_wayland_session() and not shutil.which("wl-copy"):
+        print("  wl-copy is still unavailable.")
     return False
+
+
+def configure_wayland_input_permissions():
+    if not is_wayland_session():
+        return True
+
+    import grp
+
+    target_user = os.getenv("SUDO_USER") or getpass.getuser()
+    try:
+        input_group = grp.getgrnam("input")
+        configured_member = target_user in input_group.gr_mem
+        active_member = input_group.gr_gid in os.getgroups()
+    except KeyError:
+        configured_member = False
+        active_member = False
+
+    readable_keyboard = any(
+        os.access(path, os.R_OK) for path in Path("/dev/input").glob("event*")
+    )
+    writable_uinput = os.path.exists("/dev/uinput") and os.access("/dev/uinput", os.W_OK)
+    if readable_keyboard and writable_uinput:
+        print("Wayland keyboard permissions are ready.")
+        return True
+
+    print("")
+    print("Wayland global hotkeys require access to physical keyboard events and /dev/uinput.")
+    print("This grants the local input group permission to read keyboard devices and inject keys.")
+    if not ask_yes_no("Configure Wayland keyboard permissions now?", default_yes=True):
+        print("F4/F6 cannot work globally on Wayland without these permissions.")
+        return False
+
+    command_prefix = root_command_prefix()
+    if command_prefix is None:
+        print("sudo was not found. Configure the input group and udev permissions as root.")
+        return False
+
+    if not run_cmd([*command_prefix, "groupadd", "-f", "input"]):
+        print("Failed to create or confirm the input group.")
+        return False
+    if not configured_member and not run_cmd(
+        [*command_prefix, "usermod", "-aG", "input", target_user]
+    ):
+        print(f"Failed to add {target_user} to the input group.")
+        return False
+    if not run_cmd([*command_prefix, "modprobe", "uinput"]):
+        print("Failed to load the uinput kernel module.")
+        return False
+
+    rule = (
+        'SUBSYSTEM=="input", KERNEL=="event*", GROUP="input", MODE="0660"\n'
+        'SUBSYSTEM=="misc", KERNEL=="uinput", GROUP="input", MODE="0660", '
+        'OPTIONS+="static_node=uinput"\n'
+    )
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile("w", encoding="ascii", delete=False) as f:
+            f.write(rule)
+            tmp_path = f.name
+        if not run_cmd([
+            *command_prefix,
+            "install",
+            "-m",
+            "0644",
+            tmp_path,
+            "/etc/udev/rules.d/70-global-asr-input.rules",
+        ]):
+            print("Failed to install the Global ASR udev rule.")
+            return False
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    if not run_cmd([*command_prefix, "udevadm", "control", "--reload-rules"]):
+        print("Failed to reload udev rules.")
+        return False
+    if not run_cmd([*command_prefix, "udevadm", "trigger", "--subsystem-match=input"]):
+        print("Failed to apply permissions to input devices.")
+        return False
+    if not run_cmd([*command_prefix, "udevadm", "trigger", "--subsystem-match=misc"]):
+        print("Failed to apply permissions to /dev/uinput.")
+        return False
+    print("Wayland keyboard permissions configured.")
+    if not active_member:
+        print("IMPORTANT: sign out of Ubuntu and sign back in before running Global ASR.")
+    return True
 
 
 def print_linux_system_dependency_notes():
@@ -203,7 +327,7 @@ def print_linux_system_dependency_notes():
     print("  sudo apt update")
     print(
         f"  sudo apt install -y {venv_package} {dev_package} "
-        "libportaudio2 git cmake build-essential"
+        "libportaudio2 git cmake build-essential wl-clipboard"
     )
     if venv_package != "python3-venv":
         print("")
@@ -321,6 +445,42 @@ def warm_local_model_faster_whisper(python_bin):
         return False
 
 
+def nvidia_gpu_names():
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return []
+    try:
+        proc = subprocess.run(
+            [nvidia_smi, "-L"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return []
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("GPU ")]
+
+
+def whisper_cpp_cuda_build_verified():
+    cache_path = WHISPER_CPP_DIR / "build" / "CMakeCache.txt"
+    try:
+        cache = cache_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    enabled = any(
+        line.strip() in {"GGML_CUDA:BOOL=ON", "GGML_CUDA:BOOL=1", "GGML_CUDA:BOOL=TRUE"}
+        for line in cache.splitlines()
+    )
+    cuda_artifacts = [
+        path for path in (WHISPER_CPP_DIR / "build").rglob("*ggml-cuda*")
+        if path.is_file()
+    ]
+    return enabled and bool(cuda_artifacts)
+
+
 def ensure_whisper_cpp_linux():
     missing = [name for name in ("git", "cmake", "bash") if shutil.which(name) is None]
     if missing:
@@ -336,19 +496,38 @@ def ensure_whisper_cpp_linux():
     else:
         print(f"Using existing whisper.cpp checkout: {WHISPER_CPP_DIR}")
 
+    gpus = nvidia_gpu_names()
     cmake_cmd = ["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"]
-    if shutil.which("nvcc"):
-        print("CUDA toolkit detected; building whisper.cpp with GGML_CUDA=ON.")
+    if gpus:
+        print("NVIDIA GPU detected:")
+        for gpu in gpus:
+            print(f"  {gpu}")
+        print("Building whisper.cpp with GGML_CUDA=ON.")
         cmake_cmd.append("-DGGML_CUDA=ON")
     else:
-        print("CUDA toolkit not detected; building whisper.cpp CPU-only.")
+        print("nvidia-smi -L reported no NVIDIA GPU; building whisper.cpp CPU-only.")
+        cmake_cmd.append("-DGGML_CUDA=OFF")
 
     print("Building whisper.cpp...")
     if not run_cmd(cmake_cmd, cwd=WHISPER_CPP_DIR):
-        print("Failed to configure whisper.cpp with cmake.")
+        if gpus:
+            print("Failed to configure the CUDA build of whisper.cpp.")
+            print("The GPU is present, but CMake could not locate a usable CUDA build toolkit.")
+            print("No CPU fallback was built.")
+        else:
+            print("Failed to configure whisper.cpp with cmake.")
         return False
     if not run_cmd(["cmake", "--build", "build", "--parallel", "--config", "Release"], cwd=WHISPER_CPP_DIR):
         print("Failed to build whisper.cpp.")
+        return False
+
+    whisper_binary = WHISPER_CPP_DIR / "build" / "bin" / "whisper-cli"
+    if not whisper_binary.is_file():
+        print(f"whisper.cpp build completed without the expected binary: {whisper_binary}")
+        return False
+    if gpus and not whisper_cpp_cuda_build_verified():
+        print("CUDA verification failed: the build does not contain the ggml-cuda backend.")
+        print("Refusing to continue with an unexpected CPU-only binary.")
         return False
 
     if not WHISPER_CPP_MODEL_PATH.exists():
@@ -359,7 +538,8 @@ def ensure_whisper_cpp_linux():
     else:
         print(f"Using existing whisper.cpp model: {WHISPER_CPP_MODEL_PATH}")
 
-    print("whisper.cpp is ready.")
+    acceleration = "CUDA" if gpus else "CPU"
+    print(f"whisper.cpp is ready ({acceleration}).")
     return True
 
 
@@ -397,6 +577,9 @@ def main():
     install_python = str(venv_python) if using_venv else sys.executable
 
     if os_name == "Linux" and not ensure_linux_system_dependencies(install_python):
+        sys.exit(1)
+
+    if os_name == "Linux" and not configure_wayland_input_permissions():
         sys.exit(1)
 
     if ask_yes_no("Install Python dependencies now?", default_yes=True):
@@ -500,7 +683,7 @@ def main():
             print("  source .venv/bin/activate")
     print("  python global_asr.py")
     print("Controls:")
-    print("  F6 = switch mode (AUTO <-> MANUAL)")
+    print("  F6 = cycle mode (MANUAL -> AUTO -> OFF)")
     print("  F4 in MANUAL = start/stop recording")
     print("  F4 in AUTO   = toggle auto listening")
 
