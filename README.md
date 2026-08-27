@@ -34,8 +34,12 @@ It started as a tool for talking to coding agents and other LLM workflows, but i
     - aborts when focus changes during/after speech capture
     - drops low-energy / low-confidence / garbage transcriptions
 
+- `OFF` mode:
+  - Closes the microphone and ignores the action key.
+  - Press `F6` again to return to `MANUAL`.
+
 ## Hotkeys
-- `F6`: switch mode (`AUTO` / `MANUAL`)
+- `F6`: cycle mode (`MANUAL` -> `AUTO` -> `OFF`)
 - `F4` in `MANUAL`: start/stop recording
 - `Enter` in `MANUAL`: stop current recording
 - `F4` in `AUTO`: toggle auto listening ON/OFF
@@ -48,7 +52,7 @@ Hotkeys are configurable in `.env`:
 - `ASR_CANCEL_KEY` (default: `esc`)
 
 Accepted key values:
-- any `pynput.keyboard.Key` name such as `f1`-`f20`, `esc`, `tab`, `enter`, `space`
+- key names such as `f1`-`f20`, `esc`, `tab`, `enter`, `space`
 - a single character such as `a`, `/`, `;`
 
 ## STT Backends
@@ -78,21 +82,19 @@ Platform notes:
   - local backend requires MLX stack and typically `ffmpeg`
 - Linux:
   - install `python3-venv` or the versioned package such as `python3.14-venv`
-  - install `libportaudio2` for microphone capture
-  - install the matching Python development package (for example `python3.12-dev`) so Linux keyboard support can build `evdev`
+  - setup installs `libportaudio2`, matching Python development headers, build tools, and `wl-clipboard` when needed
+  - Wayland global keys use `evdev` and `/dev/uinput`; setup installs a udev rule and adds your user to the `input` group after an explicit prompt
+  - sign out and back in once after Wayland input permissions are configured
+  - this input-group access can read keyboard events and inject key events, which is why setup does not enable it silently
+  - `AUTO` focus validation is not supported; `F6` cycles `MANUAL` -> `OFF` -> `MANUAL`
+  - local transcription uses `whisper.cpp`
+  - if `nvidia-smi -L` lists a GPU, setup requires and verifies a CUDA build; it does not silently keep a CPU-only build
+  - overlays automatically follow desktop/monitor DPI; set `ASR_OVERLAY_SCALE=1.5` in `.env` to override detection
+  - install `portaudio19-dev` only if `sounddevice` itself must build locally
   - install `rustc cargo` only if pip has to build a Rust-based package from source
-  - `MANUAL` mode works; `AUTO` mode focus validation is not currently supported
 - Windows:
   - `AUTO` mode requires `uiautomation`
   - local backend uses `faster-whisper`
-  - `MANUAL` mode works without UI focus integration
-- Linux:
-  - local backend uses `whisper.cpp`
-  - setup requires `libportaudio2`, `git`, `cmake`, and a C/C++ build toolchain
-  - Ubuntu/Debian packages: `sudo apt install -y python3-dev libportaudio2 git cmake build-essential`
-  - overlays automatically follow desktop/monitor DPI; set `ASR_OVERLAY_SCALE=1.5` in `.env` to override detection
-  - if `nvcc` is available, setup builds `whisper.cpp` with CUDA (`GGML_CUDA=ON`)
-  - if `sounddevice` must rebuild locally, also install `portaudio19-dev`
   - `MANUAL` mode works without UI focus integration
 
 ## Quick Start
@@ -103,12 +105,13 @@ python global_asr.py
 
 ## Setup Flow
 `setup_asr.py` will:
-1. On Debian/Ubuntu, detect missing Python development headers and PortAudio, then offer to install the matching packages.
-2. Install dependencies from `requirements.txt`.
-3. Ask you to choose STT backend (`local` or `openai`).
-4. If `openai` is selected, prompt for `OPENAI_API_KEY`.
-5. If `local` is selected, optionally prepare the local model/runtime (macOS MLX, Windows faster-whisper, or Linux whisper.cpp).
-6. Save configuration to `.env`.
+1. On Debian/Ubuntu, detect missing system packages and offer to install them.
+2. On Wayland, offer to configure the input-device permissions required by global hotkeys.
+3. Install dependencies from `requirements.txt`.
+4. Ask you to choose STT backend (`local` or `openai`).
+5. If `openai` is selected, prompt for `OPENAI_API_KEY`.
+6. If `local` is selected, optionally prepare the local model/runtime (macOS MLX, Windows faster-whisper, or Linux whisper.cpp).
+7. Save configuration to `.env`.
 
 ## Run Options
 ```bash
@@ -224,6 +227,14 @@ toolmd => TOOL.md | mode=all
 - `PortAudio library not found` while starting Global ASR:
   - rerun `python3 setup_asr.py`; setup will offer to install `libportaudio2`
   - the manual command is `sudo apt install -y libportaudio2`
+- F4/F6 do not respond on Ubuntu Wayland:
+  - rerun `python3 setup_asr.py` and accept Wayland keyboard permission setup
+  - sign out of Ubuntu and sign back in so the new `input` group membership becomes active
+  - verify access with `test -r /dev/input/event0 && test -w /dev/uinput && echo ready`
+- Linux local transcription unexpectedly uses the CPU:
+  - run `nvidia-smi -L`; any listed GPU makes setup request `GGML_CUDA=ON`
+  - rerun `python3 setup_asr.py` and prepare the local backend again
+  - setup now stops if the resulting build does not contain the CUDA backend
 - `OPENAI_API_KEY is required`:
   - set key in `.env` or rerun `setup_asr.py`
 - `AUTO mode unavailable` on Windows:

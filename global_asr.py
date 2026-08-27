@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import re
+import select
 import signal
 import struct
 import subprocess
@@ -94,7 +95,13 @@ _ensure_venv_active()
 
 import numpy as np
 from dotenv import load_dotenv
-from pynput.keyboard import Controller, Key, Listener
+
+_BOOTSTRAP_WAYLAND = sys.platform.startswith("linux") and (
+    os.getenv("XDG_SESSION_TYPE", "").lower() == "wayland"
+    or bool(os.getenv("WAYLAND_DISPLAY"))
+)
+if not _BOOTSTRAP_WAYLAND:
+    from pynput.keyboard import Controller, Key, KeyCode, Listener
 
 try:
     import sounddevice as sd
@@ -131,6 +138,7 @@ if not os.path.isabs(TRANSCRIPTION_REPLACEMENTS_FILE):
 IS_MAC = sys.platform == "darwin"
 IS_WINDOWS = sys.platform.startswith("win")
 IS_LINUX = sys.platform.startswith("linux")
+IS_WAYLAND = IS_LINUX and _BOOTSTRAP_WAYLAND
 FASTER_WHISPER_MODEL = os.getenv("FASTER_WHISPER_MODEL", "large-v3-turbo")
 FASTER_WHISPER_DEVICE = os.getenv("FASTER_WHISPER_DEVICE", "auto")
 FASTER_WHISPER_COMPUTE_TYPE = os.getenv(
@@ -203,27 +211,246 @@ CMD_ENTER_APPS = os.getenv("CMD_ENTER_APPS", "Code,Cursor,Google Chrome,Arc").sp
 
 # Keybindings
 def _parse_key(value, default):
-    if not value:
-        return default
-    name = value.strip().lower()
-    attr = getattr(Key, name, None)
-    if attr:
-        return attr
-    if len(name) == 1:
-        from pynput.keyboard import KeyCode
-        return KeyCode.from_char(name)
+    name = (value or default).strip().lower()
+    aliases = {"return": "enter", "escape": "esc", "control": "ctrl"}
+    name = aliases.get(name, name)
+    if len(name) == 1 or re.fullmatch(r"f(?:[1-9]|1[0-9]|20)", name):
+        return name
+    if name in {
+        "alt", "alt_l", "alt_r", "backspace", "caps_lock", "cmd", "cmd_l",
+        "cmd_r", "ctrl", "ctrl_l", "ctrl_r", "delete", "down", "end",
+        "enter", "esc", "home", "insert", "left", "page_down", "page_up",
+        "right", "shift", "shift_l", "shift_r", "space", "tab", "up",
+    }:
+        return name
     return default
 
-ACTION_KEY = _parse_key(os.getenv("ASR_ACTION_KEY"), Key.f4)
-MODE_KEY = _parse_key(os.getenv("ASR_MODE_KEY"), Key.f6)
-CANCEL_KEY = _parse_key(os.getenv("ASR_CANCEL_KEY"), Key.esc)
-STOP_KEY = _parse_key(os.getenv("ASR_STOP_KEY"), Key.enter)
+
+def _key_name(key):
+    if isinstance(key, str):
+        return _parse_key(key, key)
+    char = getattr(key, "char", None)
+    if char:
+        return char.lower()
+    name = getattr(key, "name", None)
+    if name:
+        return _parse_key(name, name)
+    text = str(key)
+    if text.startswith("Key."):
+        return _parse_key(text[4:], text[4:])
+    return text.lower()
+
+
+ACTION_KEY = _parse_key(os.getenv("ASR_ACTION_KEY"), "f4")
+MODE_KEY = _parse_key(os.getenv("ASR_MODE_KEY"), "f6")
+CANCEL_KEY = _parse_key(os.getenv("ASR_CANCEL_KEY"), "esc")
+STOP_KEY = _parse_key(os.getenv("ASR_STOP_KEY"), "enter")
+
+
+_EVDEV_SPECIAL_KEYS = {
+    "alt": "KEY_LEFTALT",
+    "alt_l": "KEY_LEFTALT",
+    "alt_r": "KEY_RIGHTALT",
+    "backspace": "KEY_BACKSPACE",
+    "caps_lock": "KEY_CAPSLOCK",
+    "cmd": "KEY_LEFTMETA",
+    "cmd_l": "KEY_LEFTMETA",
+    "cmd_r": "KEY_RIGHTMETA",
+    "ctrl": "KEY_LEFTCTRL",
+    "ctrl_l": "KEY_LEFTCTRL",
+    "ctrl_r": "KEY_RIGHTCTRL",
+    "delete": "KEY_DELETE",
+    "down": "KEY_DOWN",
+    "end": "KEY_END",
+    "enter": "KEY_ENTER",
+    "esc": "KEY_ESC",
+    "home": "KEY_HOME",
+    "insert": "KEY_INSERT",
+    "left": "KEY_LEFT",
+    "page_down": "KEY_PAGEDOWN",
+    "page_up": "KEY_PAGEUP",
+    "right": "KEY_RIGHT",
+    "shift": "KEY_LEFTSHIFT",
+    "shift_l": "KEY_LEFTSHIFT",
+    "shift_r": "KEY_RIGHTSHIFT",
+    "space": "KEY_SPACE",
+    "tab": "KEY_TAB",
+    "up": "KEY_UP",
+    "/": "KEY_SLASH",
+    ".": "KEY_DOT",
+    ",": "KEY_COMMA",
+    ";": "KEY_SEMICOLON",
+    "'": "KEY_APOSTROPHE",
+    "[": "KEY_LEFTBRACE",
+    "]": "KEY_RIGHTBRACE",
+    "\\": "KEY_BACKSLASH",
+    "`": "KEY_GRAVE",
+    "-": "KEY_MINUS",
+    "=": "KEY_EQUAL",
+}
+
+
+def _evdev_code_name(key_name):
+    key_name = _parse_key(key_name, key_name)
+    if re.fullmatch(r"f(?:[1-9]|1[0-9]|20)", key_name):
+        return f"KEY_{key_name.upper()}"
+    if len(key_name) == 1 and key_name.isalpha():
+        return f"KEY_{key_name.upper()}"
+    if len(key_name) == 1 and key_name.isdigit():
+        return f"KEY_{key_name}"
+    return _EVDEV_SPECIAL_KEYS.get(key_name)
+
+
+class PynputKeyboardAdapter:
+    def __init__(self):
+        self._controller = Controller()
+
+    @staticmethod
+    def _key(key_name):
+        key = getattr(Key, key_name, None)
+        return key if key is not None else KeyCode.from_char(key_name)
+
+    def tap(self, key_name):
+        key = self._key(key_name)
+        self._controller.press(key)
+        self._controller.release(key)
+
+    def hotkey(self, *key_names):
+        keys = [self._key(name) for name in key_names]
+        for key in keys:
+            self._controller.press(key)
+        for key in reversed(keys):
+            self._controller.release(key)
+
+    def type_text(self, text):
+        self._controller.type(text)
+
+
+class WaylandKeyboardAdapter:
+    DEVICE_NAME = "Global ASR Virtual Keyboard"
+
+    def __init__(self):
+        import evdev
+
+        self._evdev = evdev
+        key_names = {"ctrl", "shift", "insert", "enter"}
+        key_codes = [self._code(name) for name in key_names]
+        try:
+            self._device = evdev.UInput(
+                {evdev.ecodes.EV_KEY: key_codes},
+                name=self.DEVICE_NAME,
+            )
+        except OSError as e:
+            raise RuntimeError(
+                "Cannot create the Wayland virtual keyboard via /dev/uinput. "
+                "Run setup_asr.py, then sign out and back in."
+            ) from e
+
+    def _code(self, key_name):
+        code_name = _evdev_code_name(key_name)
+        if not code_name:
+            raise ValueError(f"Unsupported Wayland key: {key_name}")
+        return getattr(self._evdev.ecodes, code_name)
+
+    def _write(self, key_name, pressed):
+        self._device.write(
+            self._evdev.ecodes.EV_KEY,
+            self._code(key_name),
+            1 if pressed else 0,
+        )
+        self._device.syn()
+
+    def tap(self, key_name):
+        self._write(key_name, True)
+        self._write(key_name, False)
+
+    def hotkey(self, *key_names):
+        for key_name in key_names:
+            self._write(key_name, True)
+        for key_name in reversed(key_names):
+            self._write(key_name, False)
+
+    def type_text(self, text):
+        raise RuntimeError("Wayland text insertion uses the clipboard path")
+
+
+class WaylandKeyboardListener:
+    def __init__(self, on_press_callback, key_names):
+        import evdev
+
+        self._evdev = evdev
+        self._callback = on_press_callback
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._code_to_name = {}
+        for key_name in key_names:
+            code_name = _evdev_code_name(key_name)
+            if not code_name or not hasattr(evdev.ecodes, code_name):
+                raise RuntimeError(f"Unsupported Wayland hotkey: {key_name}")
+            self._code_to_name[getattr(evdev.ecodes, code_name)] = key_name
+        self._devices = self._open_keyboards()
+
+    def _open_keyboards(self):
+        devices = []
+        denied = []
+        for path in self._evdev.list_devices():
+            try:
+                device = self._evdev.InputDevice(path)
+            except PermissionError:
+                denied.append(path)
+                continue
+            except OSError:
+                continue
+            capabilities = device.capabilities().get(self._evdev.ecodes.EV_KEY, [])
+            if device.name != WaylandKeyboardAdapter.DEVICE_NAME and any(
+                code in capabilities for code in self._code_to_name
+            ):
+                devices.append(device)
+            else:
+                device.close()
+        if devices:
+            return devices
+        detail = f" Unreadable devices: {', '.join(denied)}." if denied else ""
+        raise RuntimeError(
+            "No readable Wayland keyboard device was found. Run setup_asr.py, "
+            f"then sign out and back in.{detail}"
+        )
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, name="wayland-hotkeys", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        for device in self._devices:
+            try:
+                device.close()
+            except OSError:
+                pass
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                readable, _, _ = select.select(self._devices, [], [], 1.0)
+            except (OSError, ValueError):
+                break
+            for device in readable:
+                try:
+                    events = device.read()
+                except OSError:
+                    continue
+                for event in events:
+                    if event.type != self._evdev.ecodes.EV_KEY or event.value != 1:
+                        continue
+                    key_name = self._code_to_name.get(event.code)
+                    if key_name:
+                        self._callback(key_name)
 
 # Runtime state
-keyboard_controller = Controller()
+keyboard_controller = None
 processing_lock = threading.Lock()
 
-MODE = "manual"  # manual | auto
+MODE = "manual"  # manual | auto | off
 AUTO_ASR_ENABLED = True
 
 SESSION_COUNTER = 0
@@ -403,6 +630,7 @@ _COREAUDIO_SYSTEM_OBJECT = 1
 _COREAUDIO_MAIN_ELEMENT = 0
 _COREAUDIO_SCOPE_GLOBAL = _coreaudio_fourcc("glob")
 _COREAUDIO_SCOPE_OUTPUT = _coreaudio_fourcc("outp")
+_COREAUDIO_DEFAULT_INPUT_DEVICE = _coreaudio_fourcc("dIn ")
 _COREAUDIO_DEFAULT_OUTPUT_DEVICE = _coreaudio_fourcc("dOut")
 _COREAUDIO_DEFAULT_SYSTEM_OUTPUT_DEVICE = _coreaudio_fourcc("sOut")
 _COREAUDIO_VIRTUAL_MAIN_VOLUME = _coreaudio_fourcc("vmvc")
@@ -478,6 +706,42 @@ def _macos_default_output_device():
         status=last_status,
     )
     return None
+
+
+def _macos_default_input_device():
+    lib = _load_audio_toolbox()
+    if lib is None:
+        return None
+
+    device_id = ctypes.c_uint32(0)
+    size = ctypes.c_uint32(ctypes.sizeof(device_id))
+    address = _AudioObjectPropertyAddress(
+        _COREAUDIO_DEFAULT_INPUT_DEVICE,
+        _COREAUDIO_SCOPE_GLOBAL,
+        _COREAUDIO_MAIN_ELEMENT,
+    )
+    status = lib.AudioObjectGetPropertyData(
+        _COREAUDIO_SYSTEM_OBJECT,
+        ctypes.byref(address),
+        0,
+        None,
+        ctypes.byref(size),
+        ctypes.byref(device_id),
+    )
+    if status == 0 and device_id.value != 0:
+        return device_id.value
+    return None
+
+
+def _refresh_sounddevice_devices():
+    try:
+        sd._terminate()
+        sd._initialize()
+        return True
+    except Exception as e:
+        print(f"Could not refresh audio device list: {e}")
+        log_event("device_refresh_error", error=str(e))
+        return False
 
 
 def _macos_get_float_property(lib, device_id, address):
@@ -760,6 +1024,36 @@ def _whisper_cpp_threads_arg():
     return str(threads) if threads > 0 else None
 
 
+def _whisper_cpp_acceleration():
+    cache_path = os.path.join(WHISPER_CPP_DIR, "build", "CMakeCache.txt")
+    try:
+        with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
+            cache = f.read()
+    except OSError:
+        return "unknown"
+    cuda_enabled = any(
+        line.strip() in {"GGML_CUDA:BOOL=ON", "GGML_CUDA:BOOL=1", "GGML_CUDA:BOOL=TRUE"}
+        for line in cache.splitlines()
+    )
+    return "CUDA" if cuda_enabled else "CPU"
+
+
+def _nvidia_gpu_names():
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("GPU ")]
+
+
 def ensure_local_backend():
     global _local_transcribe, _local_load_model, _local_backend_kind, _local_backend_obj
     if _local_transcribe is not None and _local_load_model is not None and _local_backend_kind is not None:
@@ -787,6 +1081,7 @@ def ensure_local_backend():
     if IS_LINUX:
         whisper_cpp_binary = _resolve_whisper_cpp_binary()
         whisper_cpp_model_path = os.path.abspath(WHISPER_CPP_MODEL_PATH)
+        acceleration = _whisper_cpp_acceleration()
 
         if not os.path.isfile(whisper_cpp_binary):
             print(f"Error: whisper.cpp binary not found: {whisper_cpp_binary}")
@@ -797,9 +1092,16 @@ def ensure_local_backend():
             print("Run setup again and choose the local backend to download the ggml model.")
             return False
 
+        gpus = _nvidia_gpu_names()
+        if gpus and acceleration != "CUDA":
+            print("Error: NVIDIA GPU detected, but whisper.cpp is not CUDA-enabled.")
+            print("Run python setup_asr.py and prepare the Linux local backend again.")
+            return False
+
         print(
             "Using local whisper.cpp backend "
             f"(model={os.path.basename(whisper_cpp_model_path)}, "
+            f"acceleration={acceleration}, "
             f"device={WHISPER_CPP_DEVICE or 'default'}, "
             f"threads={_whisper_cpp_threads_arg() or 'default'}, "
             f"beam={WHISPER_CPP_BEAM_SIZE or 'default'}, "
@@ -808,7 +1110,6 @@ def ensure_local_backend():
             f"fallback={'off' if WHISPER_CPP_NO_FALLBACK else 'on'}, "
             f"context={WHISPER_CPP_MAX_CONTEXT or 'default'})"
         )
-
         def local_load_model():
             return {
                 "binary": whisper_cpp_binary,
@@ -1322,18 +1623,33 @@ def apply_transcription_replacements(text):
 
 def send_message(current_app):
     if current_app in CMD_ENTER_APPS:
-        mod_key = Key.cmd if IS_MAC else Key.ctrl
-        with keyboard_controller.pressed(mod_key):
-            keyboard_controller.press(Key.enter)
-            keyboard_controller.release(Key.enter)
+        keyboard_controller.hotkey("cmd" if IS_MAC else "ctrl", "enter")
     else:
-        keyboard_controller.press(Key.enter)
-        keyboard_controller.release(Key.enter)
+        keyboard_controller.tap("enter")
     show_overlay_success()
 
 
 def paste_content(content):
-    keyboard_controller.type(content + " ")
+    text = content + " "
+    if IS_WAYLAND:
+        try:
+            proc = subprocess.run(
+                ["wl-copy", "--type", "text/plain;charset=utf-8"],
+                input=text,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            print("Wayland text insertion requires wl-copy. Run setup_asr.py.")
+            return
+        if proc.returncode != 0:
+            details = (proc.stderr or proc.stdout or "unknown error").strip()
+            print(f"Could not copy transcription to the Wayland clipboard: {details}")
+            return
+        keyboard_controller.hotkey("shift", "insert")
+        return
+    keyboard_controller.type_text(text)
 
 
 _METER_WIDTH = 20
@@ -1501,6 +1817,14 @@ class VADAudio:
         self.buffer_queue = queue.Queue()
         self.manual_recording = False
         self.manual_buffer = []
+        self._current_device = None
+        self._current_system_input_device = None
+        self._pending_system_input_device = None
+        self._refresh_device_list = False
+        self._mode_changed = threading.Event()
+
+    def notify_mode_changed(self):
+        self._mode_changed.set()
 
     def cancel_manual_recording(self):
         if not self.manual_recording:
@@ -1558,6 +1882,17 @@ class VADAudio:
             self.buffer_queue.put(indata.copy())
 
         while True:
+            if MODE == "off":
+                self._current_device = None
+                self._current_system_input_device = None
+                self._mode_changed.wait()
+                self._mode_changed.clear()
+                continue
+
+            if self._refresh_device_list:
+                _refresh_sounddevice_devices()
+                self._refresh_device_list = False
+
             input_device, dev_info = get_best_input_device()
             if input_device is None:
                 print("No microphone found. Retrying in 2s...")
@@ -1565,6 +1900,8 @@ class VADAudio:
                 continue
 
             self._current_device = input_device
+            self._current_system_input_device = _macos_default_input_device() if IS_MAC else None
+            self._pending_system_input_device = None
             print(f"Input device: {dev_info['name']}")
             log_event("device_opened", device=dev_info["name"])
 
@@ -1589,13 +1926,36 @@ class VADAudio:
                     self.buffer_queue.get_nowait()
                 except queue.Empty:
                     break
-            print("Reopening audio stream...")
+            if MODE == "off":
+                print("Microphone: OFF")
+            else:
+                print("Reopening audio stream...")
 
-    def _device_changed(self):
+    def _device_changed(self, allow_reopen=True):
+        if IS_MAC:
+            system_device = _macos_default_input_device()
+            if system_device is not None:
+                if self._current_system_input_device is None:
+                    self._current_system_input_device = system_device
+                elif system_device != self._current_system_input_device:
+                    if self._pending_system_input_device != system_device:
+                        self._pending_system_input_device = system_device
+                        log_event(
+                            "default_input_changed",
+                            previous_device_id=self._current_system_input_device,
+                            device_id=system_device,
+                        )
+                    if allow_reopen:
+                        self._refresh_device_list = True
+                        return True
+                else:
+                    self._pending_system_input_device = None
+
         nd, _ = get_best_input_device()
         if nd is not None and nd != self._current_device:
-            log_event("device_changed")
-            return True
+            if allow_reopen:
+                log_event("device_changed", previous_device=self._current_device, device=nd)
+                return True
         return False
 
     def process_stream(self):
@@ -1605,20 +1965,32 @@ class VADAudio:
         start_context = (None, None, None, None, None, None)
         ring_buffer = collections.deque(maxlen=max(1, int(SPEECH_PAD_MS / 32)))
         auto_active_prev = False
-        chunk_count = 0
+        next_device_check = time.monotonic() + 2.0
 
         while True:
             try:
-                chunk = self.buffer_queue.get(timeout=3)
+                chunk = self.buffer_queue.get(timeout=2)
             except queue.Empty:
-                if self._device_changed():
+                if MODE == "off":
+                    if _vad_model is not None:
+                        _vad_model.reset_states()
                     return
+                if self._device_changed(allow_reopen=not self.manual_recording and not triggered):
+                    return
+                next_device_check = time.monotonic() + 2.0
                 continue
 
-            chunk_flat = chunk.flatten()
-            chunk_count += 1
-            if chunk_count % 94 == 0 and self._device_changed():
+            if MODE == "off":
+                if _vad_model is not None:
+                    _vad_model.reset_states()
                 return
+
+            chunk_flat = chunk.flatten()
+            now = time.monotonic()
+            if now >= next_device_check:
+                if self._device_changed(allow_reopen=not self.manual_recording and not triggered):
+                    return
+                next_device_check = now + 2.0
 
             auto_active = MODE == "auto" and AUTO_ASR_ENABLED
 
@@ -1688,7 +2060,7 @@ class VADAudio:
 
 
 def toggle_mode():
-    global MODE
+    global MODE, AUTO_ASR_ENABLED
 
     if MODE == "manual":
         if vad_audio and vad_audio.manual_recording:
@@ -1696,10 +2068,14 @@ def toggle_mode():
 
         if not auto_mode_supported():
             if IS_WINDOWS:
-                print("AUTO mode unavailable: install Windows UIA dependency: pip install uiautomation")
+                print("AUTO mode unavailable; switching to OFF. Install UIA with: pip install uiautomation")
             else:
-                print("AUTO mode is only supported on macOS (with ./get_focus) or Windows (with UIA).")
-            show_overlay_text("AUTO unsupported", "red")
+                print("AUTO mode unsupported; switching to OFF.")
+            MODE = "off"
+            AUTO_ASR_ENABLED = False
+            print("Mode: OFF")
+            log_event("mode_change", mode="off")
+            show_mode_overlay("MODE: OFF", "red")
             return
 
         if not ensure_vad_model():
@@ -1708,11 +2084,21 @@ def toggle_mode():
             return
 
         MODE = "auto"
+        AUTO_ASR_ENABLED = True
         print("Mode: AUTO")
         log_event("mode_change", mode="auto")
         show_mode_overlay("MODE: AUTO", "green")
+    elif MODE == "auto":
+        MODE = "off"
+        AUTO_ASR_ENABLED = False
+        print("Mode: OFF")
+        log_event("mode_change", mode="off")
+        show_mode_overlay("MODE: OFF", "red")
     else:
         MODE = "manual"
+        AUTO_ASR_ENABLED = True
+        if vad_audio:
+            vad_audio.notify_mode_changed()
         print("Mode: MANUAL")
         log_event("mode_change", mode="manual")
         show_mode_overlay("MODE: MANUAL", "red")
@@ -1722,20 +2108,22 @@ def on_press(key):
     global AUTO_ASR_ENABLED
 
     try:
-        if key == CANCEL_KEY:
+        key_name = _key_name(key)
+
+        if key_name == CANCEL_KEY:
             if MODE == "manual" and vad_audio and vad_audio.manual_recording:
                 vad_audio.cancel_manual_recording()
             return
 
-        if key == STOP_KEY and MODE == "manual" and vad_audio and vad_audio.manual_recording:
+        if key_name == STOP_KEY and MODE == "manual" and vad_audio and vad_audio.manual_recording:
             vad_audio.stop_manual_recording()
             return
 
-        if key == MODE_KEY:
+        if key_name == MODE_KEY:
             toggle_mode()
             return
 
-        if key != ACTION_KEY:
+        if key_name != ACTION_KEY:
             return
 
         if MODE == "auto":
@@ -1747,6 +2135,10 @@ def on_press(key):
             return
 
         if vad_audio is None:
+            return
+
+        if MODE == "off":
+            show_mode_overlay("MODE: OFF", "red")
             return
 
         if not vad_audio.manual_recording:
@@ -1816,7 +2208,7 @@ def print_startup_intro():
     print("Global ASR")
     print("")
     print("Controls")
-    print(f"- {MODE_KEY}: switch mode (AUTO <-> MANUAL)")
+    print(f"- {MODE_KEY}: cycle mode (MANUAL -> AUTO -> OFF)")
     print(f"- {ACTION_KEY} in AUTO: toggle auto listening ON/OFF")
     print(f"- {ACTION_KEY} in MANUAL: start/stop recording")
     print(f"- {STOP_KEY} in MANUAL: stop recording")
@@ -1826,6 +2218,7 @@ def print_startup_intro():
     print("- AUTO: VAD detects speech and transcribes automatically.")
     print("        Also validates focused UI context before insertion.")
     print("- MANUAL: records only between start/stop keypresses, then transcribes once.")
+    print("- OFF: closes the microphone until the mode changes.")
     print("")
     print(f"Current mode: {MODE.upper()}")
     if MODE == "manual":
@@ -1881,7 +2274,7 @@ def _cleanup():
 
 def main():
     global SELECTED_LANGUAGE, STT_BACKEND, OPENAI_MODEL, OPENAI_PROMPT, SILENCE_WAIT, vad_audio
-    global AUDIO_DUCKING_ENABLED, AUDIO_DUCK_OUTPUT_VOLUME, AUDIO_DUCK_FADE_MS
+    global AUDIO_DUCKING_ENABLED, AUDIO_DUCK_OUTPUT_VOLUME, AUDIO_DUCK_FADE_MS, keyboard_controller
 
     args = parse_args()
     SELECTED_LANGUAGE = args.lang
@@ -1911,7 +2304,21 @@ def main():
     cleanup_stale_recording_overlays()
     show_mode_overlay("MODE: MANUAL", "red")
 
-    listener = Listener(on_press=on_press)
+    try:
+        if IS_WAYLAND:
+            keyboard_controller = WaylandKeyboardAdapter()
+            listener = WaylandKeyboardListener(
+                on_press,
+                {ACTION_KEY, MODE_KEY, CANCEL_KEY, STOP_KEY},
+            )
+            print("Keyboard backend: Wayland evdev/uinput")
+        else:
+            keyboard_controller = PynputKeyboardAdapter()
+            listener = Listener(on_press=on_press)
+            print("Keyboard backend: pynput")
+    except (OSError, RuntimeError) as e:
+        print(f"Keyboard backend unavailable: {e}")
+        sys.exit(1)
     listener.start()
 
     vad_audio = VADAudio(callback=process_audio)
