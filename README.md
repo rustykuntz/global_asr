@@ -59,17 +59,17 @@ Accepted key values:
 - Local backend:
   - macOS: Whisper Turbo (MLX)
   - Windows: faster-whisper
-  - Linux: whisper.cpp
+  - Linux: faster-whisper with prebuilt CTranslate2 CPU/CUDA wheels
 - OpenAI Audio Transcriptions API
 
 ## Repository Layout
 - `global_asr.py`: main runtime
 - `setup_asr.py`: interactive setup flow
 - `requirements.txt`: Python dependencies
+- `requirements-linux-cuda.txt`: prebuilt cuBLAS/cuDNN runtime packages for NVIDIA Linux systems
 - `overlay.py`: macOS overlay UI
 - `get_focus`: macOS focus detector used by `AUTO`
 - `whisper-turbo-mlx/`: local backend runtime files
-- `whisper.cpp/`: Linux local backend checkout created by setup when needed
 
 ## Requirements
 - Python 3.9+
@@ -87,8 +87,9 @@ Platform notes:
   - sign out and back in once after Wayland input permissions are configured
   - this input-group access can read keyboard events and inject key events, which is why setup does not enable it silently
   - `AUTO` focus validation is not supported; `F6` cycles `MANUAL` -> `OFF` -> `MANUAL`
-  - local transcription uses `whisper.cpp`
-  - if `nvidia-smi -L` lists a GPU, setup requires and verifies a CUDA build; it does not silently keep a CPU-only build
+  - local transcription uses `large-v3-turbo` through faster-whisper and prebuilt CTranslate2 wheels; no CMake or local compilation is required
+  - if `nvidia-smi -L` lists a GPU, setup installs prebuilt CUDA 12 cuBLAS/cuDNN packages and verifies that CTranslate2 can see the GPU
+  - CUDA uses FP16 by default and refuses to silently fall back to CPU
   - overlays automatically follow desktop/monitor DPI; set `ASR_OVERLAY_SCALE=1.5` in `.env` to override detection
   - install `portaudio19-dev` only if `sounddevice` itself must build locally
   - install `rustc cargo` only if pip has to build a Rust-based package from source
@@ -110,7 +111,7 @@ python global_asr.py
 3. Install dependencies from `requirements.txt`.
 4. Ask you to choose STT backend (`local` or `openai`).
 5. If `openai` is selected, prompt for `OPENAI_API_KEY`.
-6. If `local` is selected, optionally prepare the local model/runtime (macOS MLX, Windows faster-whisper, or Linux whisper.cpp).
+6. If `local` is selected, optionally prepare the local model/runtime (macOS MLX or Windows/Linux faster-whisper).
 7. Save configuration to `.env`.
 
 ## Run Options
@@ -158,22 +159,13 @@ Common keys:
 - `OPENAI_WHISPER_MODEL=whisper-1`
 - `OPENAI_WHISPER_PROMPT=...`
 - `ASR_SILENCE_WAIT=normal|long`
-- `FASTER_WHISPER_MODEL=large-v3-turbo` (optional, Windows local backend)
-- `FASTER_WHISPER_DEVICE=auto` (optional, Windows local backend)
-- `FASTER_WHISPER_COMPUTE_TYPE=int8` (optional, Windows local backend)
-- `WHISPER_CPP_DIR=whisper.cpp` (optional, Linux local backend)
-- `WHISPER_CPP_MODEL=large-v3-turbo` (optional, Linux local backend)
-- `WHISPER_CPP_MODEL_PATH=whisper.cpp/models/ggml-large-v3-turbo.bin` (optional, Linux local backend)
-- `WHISPER_CPP_BINARY=whisper.cpp/build/bin/whisper-cli` (optional, Linux local backend)
-- `WHISPER_CPP_DEVICE=0` (optional, Linux CUDA device)
-- `WHISPER_CPP_THREADS=8` (optional, Linux local backend)
-- `WHISPER_CPP_BEAM_SIZE=1` (optional, Linux local backend)
-- `WHISPER_CPP_BEST_OF=1` (optional, Linux local backend)
-- `WHISPER_CPP_TEMPERATURE=0` (optional, Linux local backend)
-- `WHISPER_CPP_TEMPERATURE_INC=0` (optional, Linux local backend)
-- `WHISPER_CPP_MAX_CONTEXT=0` (optional, Linux local backend)
-- `WHISPER_CPP_NO_FALLBACK=1` (optional, Linux local backend)
-- `WHISPER_CPP_SUPPRESS_NST=1` (optional, Linux local backend)
+- `FASTER_WHISPER_MODEL=large-v3-turbo` (Windows/Linux local backend)
+- `FASTER_WHISPER_DEVICE=cuda` (Linux NVIDIA default; use `cpu` when needed)
+- `FASTER_WHISPER_COMPUTE_TYPE=float16` (Linux NVIDIA default; CPU/Windows default is `int8`)
+- `FASTER_WHISPER_BEAM_SIZE=1`
+- `FASTER_WHISPER_BEST_OF=1`
+- `FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT=0`
+- `FASTER_WHISPER_WITHOUT_TIMESTAMPS=1`
 - `ASR_REPLACEMENTS_FILE=transcription_replacements.txt` (optional)
 - `ASR_DUCK_OUTPUT_AUDIO=1` (macOS only; lower system output volume during manual recording)
 - `ASR_DUCK_OUTPUT_VOLUME=0` (macOS only; volume percent while recording)
@@ -231,17 +223,16 @@ toolmd => TOOL.md | mode=all
   - rerun `python3 setup_asr.py` and accept Wayland keyboard permission setup
   - sign out of Ubuntu and sign back in so the new `input` group membership becomes active
   - verify access with `test -r /dev/input/event0 && test -w /dev/uinput && echo ready`
-- Linux local transcription unexpectedly uses the CPU:
-  - run `nvidia-smi -L`; any listed GPU makes setup request `GGML_CUDA=ON`
-  - rerun `python3 setup_asr.py` and prepare the local backend again
-  - setup now stops if the resulting build does not contain the CUDA backend
+- Linux local transcription cannot initialize CUDA:
+  - run `nvidia-smi -L`; any listed GPU makes setup select the CUDA lane
+  - rerun `python3 setup_asr.py`; it reinstalls the prebuilt cuBLAS/cuDNN runtime and verifies CTranslate2 before completing
+  - `nvcc`, CMake, and a local whisper.cpp build are not used
 - `OPENAI_API_KEY is required`:
   - set key in `.env` or rerun `setup_asr.py`
 - `AUTO mode unavailable` on Windows:
   - install dependency: `pip install uiautomation`
 - local backend import/load issues:
   - run `python setup_asr.py` again and select local backend
-  - on Windows, verify `faster-whisper` installed in the project venv
-  - on Linux, verify `whisper.cpp/build/bin/whisper-cli` and `whisper.cpp/models/ggml-large-v3-turbo.bin` exist
+  - on Windows/Linux, verify `faster-whisper` and `ctranslate2` are installed in the project venv
 - no microphone input:
   - verify OS microphone permission and input device selection

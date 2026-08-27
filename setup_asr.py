@@ -11,12 +11,25 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 REQ_PATH = BASE_DIR / "requirements.txt"
+CUDA_REQ_PATH = BASE_DIR / "requirements-linux-cuda.txt"
 WHISPER_DIR = BASE_DIR / "whisper-turbo-mlx"
-WHISPER_CPP_DIR = BASE_DIR / "whisper.cpp"
-WHISPER_CPP_MODEL = "large-v3-turbo"
-WHISPER_CPP_MODEL_PATH = WHISPER_CPP_DIR / "models" / f"ggml-{WHISPER_CPP_MODEL}.bin"
 FASTER_WHISPER_MODEL = "large-v3-turbo"
 DEFAULT_VENV_DIR = BASE_DIR / ".venv"
+LEGACY_WHISPER_CPP_ENV_KEYS = {
+    "WHISPER_CPP_DIR",
+    "WHISPER_CPP_MODEL",
+    "WHISPER_CPP_MODEL_PATH",
+    "WHISPER_CPP_BINARY",
+    "WHISPER_CPP_DEVICE",
+    "WHISPER_CPP_THREADS",
+    "WHISPER_CPP_BEAM_SIZE",
+    "WHISPER_CPP_BEST_OF",
+    "WHISPER_CPP_TEMPERATURE",
+    "WHISPER_CPP_TEMPERATURE_INC",
+    "WHISPER_CPP_MAX_CONTEXT",
+    "WHISPER_CPP_NO_FALLBACK",
+    "WHISPER_CPP_SUPPRESS_NST",
+}
 
 
 def ask_choice(title, options, default_index=1):
@@ -153,9 +166,7 @@ def ensure_linux_system_dependencies(python_bin):
         packages.append("libportaudio2")
 
     command_packages = {
-        "git": "git",
-        "cmake": "cmake",
-        "c++": "build-essential",
+        "cc": "build-essential",
     }
     for command, package in command_packages.items():
         if shutil.which(command) is None and package not in packages:
@@ -176,7 +187,7 @@ def ensure_linux_system_dependencies(python_bin):
     if "wl-clipboard" in packages:
         print("  wl-clipboard (Unicode text insertion on Wayland)")
     missing_build_packages = [
-        package for package in ("git", "cmake", "build-essential") if package in packages
+        package for package in ("build-essential",) if package in packages
     ]
     if missing_build_packages:
         print(f"  Build tools: {', '.join(missing_build_packages)}")
@@ -327,7 +338,7 @@ def print_linux_system_dependency_notes():
     print("  sudo apt update")
     print(
         f"  sudo apt install -y {venv_package} {dev_package} "
-        "libportaudio2 git cmake build-essential wl-clipboard"
+        "libportaudio2 build-essential wl-clipboard"
     )
     if venv_package != "python3-venv":
         print("")
@@ -400,8 +411,10 @@ def read_env(path):
     return data
 
 
-def write_env(path, updates):
+def write_env(path, updates, remove_keys=None):
     env_data = read_env(path)
+    for key in remove_keys or ():
+        env_data.pop(key, None)
     env_data.update(updates)
 
     keys = sorted(env_data.keys())
@@ -430,21 +443,6 @@ def warm_local_model_mlx(python_bin):
         return False
 
 
-def warm_local_model_faster_whisper(python_bin):
-    print("Downloading/loading faster-whisper model (one-time warmup)...")
-    try:
-        code = (
-            "from faster_whisper import WhisperModel\n"
-            f"WhisperModel({FASTER_WHISPER_MODEL!r}, device='auto', compute_type='int8')\n"
-            "print('faster-whisper model is ready.')\n"
-        )
-        subprocess.run([str(python_bin), "-c", code], check=True)
-        return True
-    except Exception as e:
-        print(f"Failed to download/load faster-whisper model: {e}")
-        return False
-
-
 def nvidia_gpu_names():
     nvidia_smi = shutil.which("nvidia-smi")
     if not nvidia_smi:
@@ -464,83 +462,91 @@ def nvidia_gpu_names():
     return [line.strip() for line in proc.stdout.splitlines() if line.strip().startswith("GPU ")]
 
 
-def whisper_cpp_cuda_build_verified():
-    cache_path = WHISPER_CPP_DIR / "build" / "CMakeCache.txt"
-    try:
-        cache = cache_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+def install_linux_cuda_runtime(python_bin):
+    print("Installing the prebuilt CUDA runtime for faster-whisper...")
+    if not run_cmd([
+        str(python_bin),
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--upgrade-strategy",
+        "eager",
+        "--prefer-binary",
+        "-r",
+        str(CUDA_REQ_PATH),
+    ]):
+        print("Failed to install the faster-whisper CUDA runtime packages.")
         return False
-    enabled = any(
-        line.strip() in {"GGML_CUDA:BOOL=ON", "GGML_CUDA:BOOL=1", "GGML_CUDA:BOOL=TRUE"}
-        for line in cache.splitlines()
-    )
-    cuda_artifacts = [
-        path for path in (WHISPER_CPP_DIR / "build").rglob("*ggml-cuda*")
-        if path.is_file()
-    ]
-    return enabled and bool(cuda_artifacts)
-
-
-def ensure_whisper_cpp_linux():
-    missing = [name for name in ("git", "cmake", "bash") if shutil.which(name) is None]
-    if missing:
-        print(f"Missing required command(s) for whisper.cpp setup: {', '.join(missing)}")
-        print("Install them with your system package manager, then re-run setup.")
+    cuda_dirs = python_cuda_library_dirs(python_bin)
+    if len(cuda_dirs) < 2:
+        print("The CUDA packages installed, but their cuBLAS/cuDNN library directories were not found.")
         return False
-
-    if not WHISPER_CPP_DIR.exists():
-        print("Cloning whisper.cpp...")
-        if not run_cmd(["git", "clone", "https://github.com/ggml-org/whisper.cpp.git", str(WHISPER_CPP_DIR)]):
-            print("Failed to clone whisper.cpp.")
-            return False
-    else:
-        print(f"Using existing whisper.cpp checkout: {WHISPER_CPP_DIR}")
-
-    gpus = nvidia_gpu_names()
-    cmake_cmd = ["cmake", "-B", "build", "-DCMAKE_BUILD_TYPE=Release"]
-    if gpus:
-        print("NVIDIA GPU detected:")
-        for gpu in gpus:
-            print(f"  {gpu}")
-        print("Building whisper.cpp with GGML_CUDA=ON.")
-        cmake_cmd.append("-DGGML_CUDA=ON")
-    else:
-        print("nvidia-smi -L reported no NVIDIA GPU; building whisper.cpp CPU-only.")
-        cmake_cmd.append("-DGGML_CUDA=OFF")
-
-    print("Building whisper.cpp...")
-    if not run_cmd(cmake_cmd, cwd=WHISPER_CPP_DIR):
-        if gpus:
-            print("Failed to configure the CUDA build of whisper.cpp.")
-            print("The GPU is present, but CMake could not locate a usable CUDA build toolkit.")
-            print("No CPU fallback was built.")
-        else:
-            print("Failed to configure whisper.cpp with cmake.")
-        return False
-    if not run_cmd(["cmake", "--build", "build", "--parallel", "--config", "Release"], cwd=WHISPER_CPP_DIR):
-        print("Failed to build whisper.cpp.")
-        return False
-
-    whisper_binary = WHISPER_CPP_DIR / "build" / "bin" / "whisper-cli"
-    if not whisper_binary.is_file():
-        print(f"whisper.cpp build completed without the expected binary: {whisper_binary}")
-        return False
-    if gpus and not whisper_cpp_cuda_build_verified():
-        print("CUDA verification failed: the build does not contain the ggml-cuda backend.")
-        print("Refusing to continue with an unexpected CPU-only binary.")
-        return False
-
-    if not WHISPER_CPP_MODEL_PATH.exists():
-        print(f"Downloading whisper.cpp model: {WHISPER_CPP_MODEL}")
-        if not run_cmd(["bash", "./models/download-ggml-model.sh", WHISPER_CPP_MODEL], cwd=WHISPER_CPP_DIR):
-            print("Failed to download whisper.cpp model.")
-            return False
-    else:
-        print(f"Using existing whisper.cpp model: {WHISPER_CPP_MODEL_PATH}")
-
-    acceleration = "CUDA" if gpus else "CPU"
-    print(f"whisper.cpp is ready ({acceleration}).")
+    print("Prebuilt faster-whisper CUDA runtime is ready.")
     return True
+
+
+def python_cuda_library_dirs(python_bin):
+    code = (
+        "import os, pathlib, site\n"
+        "paths = []\n"
+        "for root in site.getsitepackages():\n"
+        "    for package in ('cublas', 'cudnn', 'cuda_nvrtc'):\n"
+        "        path = pathlib.Path(root) / 'nvidia' / package / 'lib'\n"
+        "        if path.is_dir(): paths.append(str(path))\n"
+        "print(os.pathsep.join(paths))\n"
+    )
+    proc = subprocess.run(
+        [str(python_bin), "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    return [path for path in proc.stdout.strip().split(os.pathsep) if path]
+
+
+def faster_whisper_subprocess_env(python_bin):
+    env = os.environ.copy()
+    cuda_dirs = python_cuda_library_dirs(python_bin)
+    if cuda_dirs:
+        current_dirs = [path for path in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if path]
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(
+            dict.fromkeys([*cuda_dirs, *current_dirs])
+        )
+    return env
+
+
+def warm_local_model_faster_whisper(python_bin, device, compute_type):
+    print("Downloading/loading faster-whisper large-v3-turbo (one-time warmup)...")
+    code = (
+        "import ctranslate2, faster_whisper\n"
+        "from faster_whisper import WhisperModel\n"
+        "print(f'faster-whisper {faster_whisper.__version__}')\n"
+        "print(f'CTranslate2 {ctranslate2.__version__}')\n"
+    )
+    if device == "cuda":
+        code += (
+            "count = ctranslate2.get_cuda_device_count()\n"
+            "print(f'CTranslate2 CUDA devices: {count}')\n"
+            "if count < 1: raise SystemExit('No CUDA device available; CPU fallback is disabled.')\n"
+        )
+    code += (
+        f"WhisperModel({FASTER_WHISPER_MODEL!r}, device={device!r}, "
+        f"compute_type={compute_type!r})\n"
+        "print('faster-whisper large-v3-turbo is ready.')\n"
+    )
+    try:
+        subprocess.run(
+            [str(python_bin), "-c", code],
+            check=True,
+            env=faster_whisper_subprocess_env(python_bin),
+        )
+        return True
+    except Exception as e:
+        print(f"Failed to download/load faster-whisper model: {e}")
+        return False
 
 
 def main():
@@ -601,7 +607,7 @@ def main():
         backend = ask_choice(
             "Choose speech backend:",
             [
-                ("local", "Local Whisper Turbo via whisper.cpp (recommended on Linux)"),
+                ("local", "Local Whisper large-v3-turbo via faster-whisper (recommended on Linux)"),
                 ("openai", "OpenAI Whisper API"),
             ],
             default_index=1,
@@ -633,21 +639,32 @@ def main():
         "STT_BACKEND": backend,
         "ASR_VENV_PATH": ".venv",
     }
+    local_device = "auto"
+    local_compute_type = "int8"
     if backend == "local" and os_name == "Linux":
+        gpus = nvidia_gpu_names()
+        if gpus:
+            print("")
+            print("NVIDIA GPU detected:")
+            for gpu in gpus:
+                print(f"  {gpu}")
+            if not install_linux_cuda_runtime(install_python):
+                sys.exit(1)
+            local_device = "cuda"
+            local_compute_type = "float16"
+        else:
+            print("nvidia-smi -L reported no NVIDIA GPU; using faster-whisper on CPU.")
+            local_device = "cpu"
+            local_compute_type = "int8"
         updates.update(
             {
-                "WHISPER_CPP_DIR": "whisper.cpp",
-                "WHISPER_CPP_MODEL": WHISPER_CPP_MODEL,
-                "WHISPER_CPP_MODEL_PATH": f"whisper.cpp/models/ggml-{WHISPER_CPP_MODEL}.bin",
-                "WHISPER_CPP_BINARY": "whisper.cpp/build/bin/whisper-cli",
-                "WHISPER_CPP_DEVICE": "0",
-                "WHISPER_CPP_BEAM_SIZE": "1",
-                "WHISPER_CPP_BEST_OF": "1",
-                "WHISPER_CPP_TEMPERATURE": "0",
-                "WHISPER_CPP_TEMPERATURE_INC": "0",
-                "WHISPER_CPP_MAX_CONTEXT": "0",
-                "WHISPER_CPP_NO_FALLBACK": "1",
-                "WHISPER_CPP_SUPPRESS_NST": "1",
+                "FASTER_WHISPER_MODEL": FASTER_WHISPER_MODEL,
+                "FASTER_WHISPER_DEVICE": local_device,
+                "FASTER_WHISPER_COMPUTE_TYPE": local_compute_type,
+                "FASTER_WHISPER_BEAM_SIZE": "1",
+                "FASTER_WHISPER_BEST_OF": "1",
+                "FASTER_WHISPER_CONDITION_ON_PREVIOUS_TEXT": "0",
+                "FASTER_WHISPER_WITHOUT_TIMESTAMPS": "1",
             }
         )
 
@@ -659,7 +676,7 @@ def main():
                 break
             print("API key cannot be empty.")
 
-    write_env(ENV_PATH, updates)
+    write_env(ENV_PATH, updates, remove_keys=LEGACY_WHISPER_CPP_ENV_KEYS)
     print(f"Saved configuration: {ENV_PATH}")
 
     if backend == "local" and os_name in {"Darwin", "Windows", "Linux"}:
@@ -667,12 +684,15 @@ def main():
         if ask_yes_no("Prepare local backend now?", default_yes=True):
             if os_name == "Darwin":
                 ok = warm_local_model_mlx(install_python)
-            elif os_name == "Windows":
-                ok = warm_local_model_faster_whisper(install_python)
             else:
-                ok = ensure_whisper_cpp_linux()
+                ok = warm_local_model_faster_whisper(
+                    install_python,
+                    local_device,
+                    local_compute_type,
+                )
             if not ok:
-                print("Local backend setup failed. You can retry later by running setup again.")
+                print("Local backend setup failed. Re-run setup after resolving the error above.")
+                sys.exit(1)
 
     print("\nSetup complete.")
     print("Run:")
