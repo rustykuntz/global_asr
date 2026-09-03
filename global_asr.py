@@ -396,9 +396,10 @@ class WaylandKeyboardAdapter:
         self._write(key_name, True)
         self._write(key_name, False)
 
-    def hotkey(self, *key_names):
+    def hotkey(self, *key_names, hold_s=0.02):
         for key_name in key_names:
             self._write(key_name, True)
+        time.sleep(hold_s)
         for key_name in reversed(key_names):
             self._write(key_name, False)
 
@@ -1570,24 +1571,50 @@ def send_message(current_app):
 def paste_content(content):
     text = content + " "
     if IS_WAYLAND:
+        clipboard_start = time.perf_counter()
+        log_event(
+            "wayland_clipboard_start",
+            text_chars=len(text),
+            text_bytes=len(text.encode("utf-8")),
+        )
         try:
             proc = subprocess.run(
                 ["wl-copy", "--type", "text/plain;charset=utf-8"],
                 input=text,
                 text=True,
-                capture_output=True,
                 check=False,
             )
         except FileNotFoundError:
+            log_event("wayland_clipboard_finished", success=False, error="wl-copy not found")
             print("Wayland text insertion requires wl-copy. Run setup_asr.py.")
-            return
+            return False
+        clipboard_time = time.perf_counter() - clipboard_start
+        log_event(
+            "wayland_clipboard_finished",
+            success=proc.returncode == 0,
+            returncode=proc.returncode,
+            elapsed=round(clipboard_time, 4),
+        )
         if proc.returncode != 0:
             details = (proc.stderr or proc.stdout or "unknown error").strip()
             print(f"Could not copy transcription to the Wayland clipboard: {details}")
-            return
-        keyboard_controller.hotkey("shift", "insert")
-        return
+            return False
+        paste_hold_s = min(0.1, 0.01 + len(text.encode("utf-8")) * 0.0001)
+        key_start = time.perf_counter()
+        log_event(
+            "wayland_paste_key_start",
+            shortcut="shift+insert",
+            hold_ms=round(paste_hold_s * 1000, 1),
+        )
+        keyboard_controller.hotkey("shift", "insert", hold_s=paste_hold_s)
+        log_event(
+            "wayland_paste_key_finished",
+            shortcut="shift+insert",
+            elapsed=round(time.perf_counter() - key_start, 4),
+        )
+        return True
     keyboard_controller.type_text(text)
+    return True
 
 
 _METER_WIDTH = 20
@@ -1615,7 +1642,15 @@ def has_low_confidence(avg_logprob, threshold):
 def process_audio(audio_data, start_context=None, end_context=None, source_mode="auto"):
     global last_paste_time, SESSION_COUNTER
 
+    queued_at = time.perf_counter()
+    queued_duration = len(audio_data) / SAMPLE_RATE
+    log_event(
+        "processing_queued",
+        mode=source_mode,
+        duration=round(queued_duration, 2),
+    )
     with processing_lock:
+        lock_wait = time.perf_counter() - queued_at
         SESSION_COUNTER += 1
 
         start_app = "MANUAL"
@@ -1626,6 +1661,13 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
         end_title = None
 
         duration = len(audio_data) / SAMPLE_RATE
+        log_event(
+            "processing_started",
+            session=SESSION_COUNTER,
+            mode=source_mode,
+            duration=round(duration, 2),
+            lock_wait=round(lock_wait, 4),
+        )
 
         if source_mode == "auto":
             if not start_context or not end_context:
@@ -1652,8 +1694,24 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
 
         try:
             start_time = time.perf_counter()
+            log_event(
+                "transcription_started",
+                session=SESSION_COUNTER,
+                mode=source_mode,
+                backend=STT_BACKEND,
+                duration=round(duration, 2),
+            )
             result = transcribe_audio(audio_data)
             inference_time = time.perf_counter() - start_time
+            log_event(
+                "transcription_finished",
+                session=SESSION_COUNTER,
+                mode=source_mode,
+                backend=STT_BACKEND,
+                duration=round(duration, 2),
+                inference_time=round(inference_time, 4),
+                success=bool(result),
+            )
             if not result:
                 log_drop("transcription_empty", duration=round(duration, 2))
                 return
@@ -1702,7 +1760,7 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
                 elif has_low_confidence(avg_logprob, ASR_DICTATION_THRESHOLD):
                     action_type = "IGNORE"
             else:
-                if has_low_confidence(avg_logprob, ASR_DICTATION_THRESHOLD):
+                if not IS_LINUX and has_low_confidence(avg_logprob, ASR_DICTATION_THRESHOLD):
                     action_type = "IGNORE"
 
             if action_type == "IGNORE":
@@ -1714,8 +1772,25 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
                     send_message(start_app)
                 return
 
-            paste_content(action_payload)
-            last_paste_time = time.time()
+            paste_start = time.perf_counter()
+            log_event(
+                "paste_started",
+                session=SESSION_COUNTER,
+                mode=source_mode,
+                text_chars=len(action_payload),
+                text_bytes=len(action_payload.encode("utf-8")),
+            )
+            paste_success = paste_content(action_payload)
+            paste_time = time.perf_counter() - paste_start
+            log_event(
+                "paste_finished",
+                session=SESSION_COUNTER,
+                mode=source_mode,
+                success=bool(paste_success),
+                elapsed=round(paste_time, 4),
+            )
+            if paste_success:
+                last_paste_time = time.time()
 
             conf_part = f"conf={avg_logprob:.3f}" if avg_logprob is not None else "conf=n/a"
             print(
@@ -1733,6 +1808,8 @@ def process_audio(audio_data, start_context=None, end_context=None, source_mode=
                 no_speech_prob=no_speech_prob,
                 compression_ratio=compression,
                 inference_time=round(inference_time, 2),
+                paste_success=bool(paste_success),
+                paste_time=round(paste_time, 4),
                 app=start_app,
             )
 
